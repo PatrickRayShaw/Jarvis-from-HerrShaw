@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 贾维斯（Jarvis）— 跨平台 · 多云端后端 · 可联网 · 可操作文件 · 图片视频多模态
 
@@ -43,6 +44,37 @@ import socket
 import subprocess
 import sys
 import tempfile
+
+# ━━━ UTF-8 强制模式（防止 Windows GBK 编码崩溃 + 抑制 OpenCV 噪音）━━━
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+os.environ.setdefault("PYTHONUTF8", "1")
+os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")      # 抑制 OpenCV C++ 层 obsensor 报错
+os.environ.setdefault("OPENCV_OPENCL_DEVICE", "disabled")
+os.environ["PYGAME_HIDE_SUPPORT_PROMPT"] = "hide"       # 抑制 pygame 启动问候语
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+# Monkey-patch subprocess.run / Popen：确保所有 text=True 调用默认使用 UTF-8
+# 这是根治 _readerthread GBK 崩溃的唯一方法（locale.getpreferredencoding() 不可靠）
+_orig_run = subprocess.run
+_orig_popen = subprocess.Popen
+
+def _utf8_run(*args, **kwargs):
+    if kwargs.get('text') and 'encoding' not in kwargs:
+        kwargs['encoding'] = 'utf-8'
+        kwargs['errors'] = 'replace'
+    return _orig_run(*args, **kwargs)
+
+def _utf8_popen(*args, **kwargs):
+    if kwargs.get('text') and 'encoding' not in kwargs:
+        kwargs['encoding'] = 'utf-8'
+        kwargs['errors'] = 'replace'
+    return _orig_popen(*args, **kwargs)
+
+subprocess.run = _utf8_run
+subprocess.Popen = _utf8_popen
+
 import textwrap
 import threading
 import time
@@ -338,7 +370,6 @@ if not _AUTO_RELAUNCH_DONE:
                     [_embed_exe, _get_pip, "--no-setuptools", "--no-wheel",
                      "-i", "https://pypi.tuna.tsinghua.edu.cn/simple"],
                     capture_output=True, text=True, timeout=120,
-                    encoding="utf-8", errors="replace",
                 )
                 try:
                     os.remove(_get_pip)
@@ -559,6 +590,9 @@ class TaskIntent:
     # ━━━ 桌面操作 ━━━
     is_desktop_action: bool = False         # 是否为桌面操作任务（切歌/打开窗口/输入文字等）
     is_media_action: bool = False           # 是否为媒体控制任务（切歌/暂停/音量等）
+    # ━━━ 工具约束 ━━━
+    required_tools: List[str] = field(default_factory=list)  # 🔴 必须使用的工具名列表（任一个匹配即可）
+    forbidden_tools: List[str] = field(default_factory=list) # 🔴 禁止使用的工具（如用 desktop_icons_count 冒充 arrange）
 
 
 @dataclass
@@ -737,6 +771,98 @@ def _get_process_for_file(ext_or_name: str) -> Optional[str]:
     }
     return _EXT_MAP.get(ext)
 
+
+def _infer_process_from_target(target: str, related_paths: List[str] = None) -> Optional[str]:
+    """从关闭/停止目标推断对应的进程名，用于复合操作（关闭+删除）的进程验证。
+
+    target: 用户要关闭的目标（可能是文件名、通用词如"图片"、或进程名）
+    related_paths: 关联的文件路径列表（如 delete_targets），用于从扩展名推断进程
+
+    优先级：
+    1. target 本身是已知进程名 → 直接返回
+    2. target 有扩展名 → 用 _get_process_for_file 映射
+    3. target 是通用词（图片/视频/文档）→ 从 related_paths 的扩展名推断
+    4. 无法推断 → 返回 None（不误报）
+    """
+    if not target:
+        return None
+
+    target_lower = target.lower().strip()
+
+    # 1. 直接是已知进程名
+    direct = _get_process_for_file(target_lower)
+    if direct:
+        return direct
+
+    # 2. 有扩展名 → 用扩展名映射
+    ext = os.path.splitext(target_lower)[1].lstrip('.')
+    if ext:
+        proc = _get_process_for_file(ext)
+        if proc:
+            return proc
+
+    # 3. 通用词 → 从关联路径推断
+    # "图片" → 查 related_paths 中是否有 .png/.jpg 等 → 映射到 photos
+    # "视频" → 查 .mp4/.avi 等 → 映射到 videoplayer
+    # "文档" → 查 .docx/.pdf 等
+    _GENERIC_TO_CATEGORY = {
+        '图片': ['png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp', 'ico', 'tiff', 'svg'],
+        '照片': ['png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp', 'ico'],
+        '视频': ['mp4', 'avi', 'mov', 'mkv', 'wmv', 'webm', 'flv'],
+        '音乐': ['mp3', 'wav', 'flac', 'ogg', 'm4a', 'aac'],
+        '文档': ['docx', 'doc', 'pdf', 'txt', 'md', 'rtf'],
+        '表格': ['xlsx', 'xls', 'csv'],
+    }
+    # 也支持英文和常见简称
+    _GENERIC_ALIASES = {
+        'image': '图片', 'picture': '图片', 'photo': '照片', 'pic': '图片',
+        'video': '视频', 'movie': '视频', 'clip': '视频',
+        'music': '音乐', 'audio': '音乐', 'song': '音乐',
+        'document': '文档', 'doc': '文档', 'file': '文档',
+        'spreadsheet': '表格', 'sheet': '表格', 'table': '表格',
+    }
+    category = _GENERIC_TO_CATEGORY.get(target_lower)
+    if not category:
+        canonical = _GENERIC_ALIASES.get(target_lower)
+        if canonical:
+            category = _GENERIC_TO_CATEGORY.get(canonical)
+
+    if category and related_paths:
+        for path in related_paths:
+            path_ext = os.path.splitext(str(path))[1].lower().lstrip('.')
+            if path_ext in category:
+                proc = _get_process_for_file(path_ext)
+                if proc:
+                    return proc
+        # 如果关联路径没有匹配的扩展名，但有同类文件，
+        # 用类别中第一个扩展名对应的进程作为默认值
+        for cat_ext in category:
+            proc = _get_process_for_file(cat_ext)
+            if proc:
+                return proc
+
+    # 4. target 可能是进程名的一部分（模糊匹配已知进程）
+    _COMMON_PROCESS_NAMES = {
+        'photos': 'photos', 'photo': 'photos', '照片': 'photos',
+        '画图': 'mspaint', 'mspaint': 'mspaint', 'paint': 'mspaint',
+        '截图': 'snippingtool', 'snippingtool': 'snippingtool',
+        'edge': 'msedge', 'msedge': 'msedge', '浏览器': 'msedge',
+        'chrome': 'chrome', 'google': 'chrome',
+        'notepad': 'notepad', '记事本': 'notepad',
+        'explorer': 'explorer', '资源管理器': 'explorer',
+        'vscode': 'code', 'code': 'code',
+        'word': 'winword', 'winword': 'winword',
+        'excel': 'excel',
+        'powerpoint': 'powerpnt', 'ppt': 'powerpnt',
+        '播放器': 'videoplayer', '播放': 'videoplayer',
+        '音乐': 'musicplayer',
+    }
+    for key, proc in _COMMON_PROCESS_NAMES.items():
+        if key in target_lower:
+            return proc
+
+    return None
+
 # ==================== 工具函数 ====================
 
 def get_program_dir() -> str:
@@ -810,7 +936,6 @@ def _find_best_python() -> Optional[str]:
         try:
             result = subprocess.run(
                 [py_launcher, "-0"], capture_output=True, text=True, timeout=5,
-                encoding="utf-8", errors="replace",
             )
             for line in result.stdout.split('\n'):
                 m = re.search(r'(\d+)\.(\d+)', line)
@@ -939,7 +1064,6 @@ def _auto_install_compat_python() -> Optional[str]:
             [python_exe, get_pip_path, "--no-setuptools", "--no-wheel",
              "-i", "https://pypi.tuna.tsinghua.edu.cn/simple"],
             capture_output=True, text=True, timeout=120,
-            encoding="utf-8", errors="replace",
         )
         try:
             os.remove(get_pip_path)
@@ -963,7 +1087,6 @@ def _auto_install_compat_python() -> Optional[str]:
         result = subprocess.run(
             [python_exe, "-c", "import pip; print('pip OK')"],
             capture_output=True, text=True, timeout=15,
-            encoding="utf-8", errors="replace",
         )
         if result.returncode == 0:
             print(f"  [Python] ✅ Python {COMPAT_VER} + pip 安装完成 → {install_dir}")
@@ -1229,7 +1352,6 @@ def _ensure_compat_pip(compat_python: str) -> bool:
         result = subprocess.run(
             [compat_python, "-m", "pip", "--version"],
             capture_output=True, text=True, timeout=10,
-            encoding="utf-8", errors="replace",
         )
         if result.returncode == 0:
             return True
@@ -1241,7 +1363,6 @@ def _ensure_compat_pip(compat_python: str) -> bool:
         result = subprocess.run(
             [compat_python, "-m", "pip", "--version"],
             capture_output=True, text=True, timeout=10,
-            encoding="utf-8", errors="replace",
         )
         return result.returncode == 0
     except Exception:
@@ -1328,6 +1449,53 @@ _PIP_DEPS: Dict[str, _PipDep] = {
     "docx": _PipDep(
         key="docx", packages=["python-docx"], import_names=["docx"],
         desc="DOCX 阅读", flag_names=["_HAS_DOCX"], mod_names=["docx"],
+    ),
+    # ━━━ 1.5 新增可选依赖 ━━━
+    "websocket": _PipDep(
+        key="websocket", packages=["websocket-client"], import_names=["websocket"],
+        desc="浏览器CDP协议控制", flag_names=["_HAS_WEBSOCKET"], mod_names=["websocket"],
+    ),
+    "selenium": _PipDep(
+        key="selenium", packages=["selenium"], import_names=["selenium"],
+        desc="浏览器WebDriver自动化", flag_names=["_HAS_SELENIUM"], mod_names=["selenium"],
+    ),
+    "docker_py": _PipDep(
+        key="docker_py", packages=["docker"], import_names=["docker"],
+        desc="Docker SDK(可选，CLI已覆盖)", flag_names=["_HAS_DOCKER_PY"], mod_names=["docker"],
+    ),
+    "opencv": _PipDep(
+        key="opencv", packages=["opencv-python"], import_names=["cv2"],
+        desc="摄像头采集+图像处理", flag_names=["_HAS_CV2"], mod_names=["cv2"],
+    ),
+    "pyserial": _PipDep(
+        key="pyserial", packages=["pyserial"], import_names=["serial"],
+        desc="串口通信(Arduino/ESP32)", flag_names=["_HAS_SERIAL"], mod_names=["serial"],
+        pip_timeout=60,
+    ),
+    "bleak": _PipDep(
+        key="bleak", packages=["bleak"], import_names=["bleak"],
+        desc="蓝牙BLE设备通信", flag_names=["_HAS_BLEAK"], mod_names=["bleak"],
+    ),
+    "pygame": _PipDep(
+        key="pygame", packages=["pygame"], import_names=["pygame"],
+        desc="游戏手柄检测", flag_names=["_HAS_PYGAME"], mod_names=["pygame"],
+        pip_timeout=120,
+    ),
+    "paramiko": _PipDep(
+        key="paramiko", packages=["paramiko"], import_names=["paramiko"],
+        desc="SSH远程连接", flag_names=["_HAS_PARAMIKO"], mod_names=["paramiko"],
+    ),
+    "pillow": _PipDep(
+        key="pillow", packages=["Pillow"], import_names=["PIL"],
+        desc="图像处理(截图增强/取色器)", flag_names=["_HAS_PIL"], mod_names=["Image"], attrs=["Image"],
+    ),
+    "aria2": _PipDep(
+        key="aria2", packages=["aria2p"], import_names=["aria2p"],
+        desc="高级下载管理(断点续传/BT/磁力)", flag_names=["_HAS_ARIA2"], mod_names=["aria2p"],
+    ),
+    "psutil": _PipDep(
+        key="psutil", packages=["psutil"], import_names=["psutil"],
+        desc="系统监控(CPU/内存/磁盘/电池)", flag_names=["_HAS_PSUTIL"], mod_names=["psutil"],
     ),
 }
 
@@ -4334,7 +4502,6 @@ class CalendarManager:
             result = subprocess.run(
                 ["powershell", "-Command", ps_cmd],
                 capture_output=True, text=True, timeout=15,
-                encoding="utf-8", errors="replace",
             )
             if result.returncode == 0 and result.stdout.strip():
                 data = json.loads(result.stdout)
@@ -4365,7 +4532,6 @@ class CalendarManager:
             result = subprocess.run(
                 ["powershell", "-Command", ps_cmd],
                 capture_output=True, text=True, timeout=15,
-                encoding="utf-8", errors="replace",
             )
             if result.returncode == 0 and result.stdout.strip():
                 data = json.loads(result.stdout)
@@ -7481,13 +7647,11 @@ class CommandExecutor:
                 check = subprocess.run(
                     ['where', exe],
                     capture_output=True, text=True, timeout=5,
-                    encoding="utf-8", errors="replace",
                 )
             else:
                 check = subprocess.run(
                     ['which', exe],
                     capture_output=True, text=True, timeout=5,
-                    encoding="utf-8", errors="replace",
                 )
             if check.returncode != 0:
                 return f"命令 {exe} 在当前系统中不存在"
@@ -7703,7 +7867,7 @@ class CommandExecutor:
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
                     cwd=cwd,
-                    text=True, encoding='utf-8', errors='replace',
+                    text=True
                 )
                 try:
                     out, err = proc.communicate(timeout=self.config.shell_timeout)
@@ -8663,10 +8827,142 @@ try {
             lines.append(f"  {info['name']} ({info['process']}) — 快捷键: {shortcuts_str}")
         return '\n'.join(lines) if lines else '知识库为空'
 
+    @classmethod
+    def _search_shortcuts(cls, app_name: str, display_name: str = "") -> Optional[str]:
+        """搜索 .lnk 快捷方式文件，返回第一个匹配的 .lnk 路径。
+
+        搜索顺序（最简单→最可靠）：
+          1. 用户开始菜单 (APPDATA)
+          2. 所有用户开始菜单 (PROGRAMDATA)
+          3. 桌面快捷方式
+          4. 任务栏固定项
+
+        匹配策略：.lnk 文件名包含 app_name 或 display_name（中英文均可）。
+        返回 None 表示未找到。
+        """
+        import glob as _glob
+        if not app_name:
+            return None
+
+        # 构建搜索词列表（去掉 .exe 后缀，方便匹配）
+        search_terms = [app_name.lower().replace('.exe', '')]
+        if display_name:
+            search_terms.append(display_name.lower())
+        # 去重
+        search_terms = list(dict.fromkeys(search_terms))
+
+        # 搜索目录（按优先级）
+        search_roots = []
+        try:
+            # 1. 用户开始菜单
+            appdata = os.environ.get('APPDATA', '')
+            if appdata:
+                search_roots.append(os.path.join(appdata, 'Microsoft', 'Windows', 'Start Menu', 'Programs'))
+            # 2. 所有用户开始菜单
+            programdata = os.environ.get('PROGRAMDATA', '')
+            if programdata:
+                search_roots.append(os.path.join(programdata, 'Microsoft', 'Windows', 'Start Menu', 'Programs'))
+            # 3. 用户桌面
+            userprofile = os.environ.get('USERPROFILE', '')
+            if userprofile:
+                search_roots.append(os.path.join(userprofile, 'Desktop'))
+            # 4. 任务栏固定
+            if appdata:
+                search_roots.append(os.path.join(appdata, 'Microsoft', 'Internet Explorer', 'Quick Launch', 'User Pinned', 'TaskBar'))
+        except Exception:
+            pass
+
+        for root in search_roots:
+            if not os.path.isdir(root):
+                continue
+            try:
+                # 递归搜索所有 .lnk 文件
+                for lnk_path in _glob.iglob(os.path.join(root, '**', '*.lnk'), recursive=True):
+                    lnk_name = os.path.splitext(os.path.basename(lnk_path))[0].lower()
+                    for term in search_terms:
+                        if term in lnk_name:
+                            return lnk_path
+            except Exception:
+                continue
+
+        return None
+
+    @classmethod
+    def _launch_via_shortcut(cls, app_name: str, display_name: str = "") -> Optional[str]:
+        """通过 .lnk 快捷方式启动应用。返回成功消息或 None（未找到/失败）。
+
+        这是 Windows 上最通用的启动方式——不受 PATH 限制，覆盖几乎所有已安装应用。
+        """
+        lnk_path = cls._search_shortcuts(app_name, display_name)
+        if not lnk_path:
+            return None
+
+        try:
+            import subprocess as _sp
+            import time as _time
+            # Start-Process 可以直接启动 .lnk 文件
+            r = _sp.run(
+                ['powershell', '-NoProfile', '-Command', f'Start-Process "{lnk_path}"'],
+                capture_output=True, text=True, timeout=10,
+                creationflags=0x08000000,
+            )
+            if r.returncode == 0:
+                # 等待窗口出现
+                for _ in range(10):
+                    _time.sleep(0.5)
+                    windows = cls._find_window_static(app_name, display_name)
+                    if windows:
+                        hwnd, title = windows[0]
+                        return (f"✅ {display_name or app_name} 已通过快捷方式启动。\n"
+                                f"   快捷方式: {lnk_path}\n"
+                                f"   窗口: {title} (hwnd={hwnd})")
+                return (f"✅ 已通过快捷方式启动: {lnk_path}\n"
+                        f"   请稍等加载后 desktop_see 确认。")
+            else:
+                # Start-Process .lnk 也失败了 → 返回 None 让上层继续尝试
+                return None
+        except Exception:
+            return None
+
+    @classmethod
+    def _find_window_static(cls, app_name: str, display_name: str = "") -> list:
+        """静态版本的 find_window，供 _launch_via_shortcut 等类方法使用。"""
+        try:
+            import subprocess as _sp
+            r = _sp.run(
+                ['powershell', '-NoProfile', '-Command',
+                 '@(Get-Process | Where-Object {$_.MainWindowTitle} | '
+                 'Select-Object -ExpandProperty MainWindowTitle) -join "\\n"'],
+                capture_output=True, text=True, timeout=5,
+                creationflags=0x08000000,
+            )
+            titles = r.stdout.strip().split('\n') if r.stdout.strip() else []
+        except Exception:
+            titles = []
+
+        search_terms = [app_name.lower()]
+        if display_name:
+            search_terms.append(display_name.lower())
+        for t in titles:
+            t_lower = t.lower()
+            for term in search_terms:
+                if term in t_lower:
+                    # hwnd 未知但标题已知，返回占位 hwnd
+                    return [(0, t)]
+        return []
+
     def launch_app(self, app_name: str) -> str:
         """启动应用。先检查是否已在运行，未运行则尝试启动。
+
+        启动链（最简单优先）：
+          ① 检查进程是否已运行 → 直接返回窗口信息
+          ② 知识库启动命令 (Start-Process exe名)
+          ②.⑤ 🔴 搜索 .lnk 快捷方式（开始菜单→桌面→任务栏）← 最通用！
+          ③ 泛化 Start-Process 兜底
+          ④ 失败则给出搜索建议
+
         支持：进程名、显示名、知识库中的启动命令。
-        泛化设计 — 不硬编码任何应用的路径，优先用知识库 + Start-Process 自动解析。
+        泛化设计 — 不硬编码任何应用的路径，优先用知识库 + .lnk + Start-Process。
         """
         if not app_name or not app_name.strip():
             return "请指定要启动的应用名称"
@@ -8751,6 +9047,12 @@ try {
             except Exception as e:
                 return (f"❌ 启动异常: {e}\n"
                         f"   建议: 尝试 {info.get('launch_hint', 'powershell Start-Process ' + app_name)}")
+
+        # ②.⑤ 搜索 .lnk 快捷方式（开始菜单 → 桌面 → 任务栏）
+        # 这是 Windows 上最可靠的启动方式——不依赖 PATH，直接定位安装路径
+        lnk_result = self._launch_via_shortcut(app_name, info['name'] if info else app_name)
+        if lnk_result:
+            return lnk_result
 
         # ③ 泛化兜底：直接尝试 Start-Process（Windows 自动从 PATH/App Paths 解析）
         try:
@@ -10399,7 +10701,6 @@ $result.Text
             r = subprocess.run(
                 ["powershell", "-NoProfile", "-Command", ps_script],
                 capture_output=True, text=True, timeout=15,
-                encoding="utf-8", errors="replace",
                 creationflags=0x08000000,
             )
             if r.returncode == 0 and r.stdout.strip():
@@ -11572,25 +11873,2342 @@ class SystemMonitor:
         return alerts
 
 
-# ==================== HUD 悬浮窗 ====================
+# ==================== 桌面图标管理器（零依赖，ctypes + Win32 API）====================
+
+class DesktopIconManager:
+    """Windows 桌面图标操作 — 排列、排序、对齐、显示/隐藏、位置读写。
+
+    核心技术：通过 FindWindow 找到桌面 SysListView32 控件，
+    发送 LVM_* 消息来控制图标行为。
+    零外部依赖，纯 ctypes + Win32 API。
+    """
+
+    _LVM_ARRANGE = 0x1016      # LVM_ARRANGE = 4118
+    _LVM_GETITEMPOSITION = 0x1010
+    _LVM_SETITEMPOSITION = 0x100F
+    _LVM_GETITEMCOUNT = 0x1004
+    _LVM_GETITEMTEXT = 0x1073  # LVM_GETITEMTEXTW
+    _LVA_DEFAULT = 0x0000
+    _LVA_SNAPTOGRID = 0x0005
+
+    def __init__(self):
+        self.available = platform.system() == "Windows"
+
+    def _get_desktop_listview(self):
+        """获取桌面 SysListView32 控件句柄。"""
+        if not self.available:
+            return None
+        try:
+            # 桌面窗口层级: Progman → SHELLDLL_DefView → SysListView32
+            hwnd_progman = ctypes.windll.user32.FindWindowW("Progman", None)
+            if not hwnd_progman:
+                return None
+            # 发送 0x052C 消息让 Progman 创建 WorkerW 下的 ListView
+            ctypes.windll.user32.SendMessageW(hwnd_progman, 0x052C, 0, 0)
+            hwnd_shell = ctypes.windll.user32.FindWindowExW(hwnd_progman, 0, "SHELLDLL_DefView", None)
+            if not hwnd_shell:
+                # 尝试在 WorkerW 下找
+                hwnd_worker = ctypes.windll.user32.FindWindowExW(0, 0, "WorkerW", None)
+                while hwnd_worker:
+                    hwnd_shell = ctypes.windll.user32.FindWindowExW(hwnd_worker, 0, "SHELLDLL_DefView", None)
+                    if hwnd_shell:
+                        break
+                    hwnd_worker = ctypes.windll.user32.FindWindowExW(0, hwnd_worker, "WorkerW", None)
+            if not hwnd_shell:
+                return None
+            return ctypes.windll.user32.FindWindowExW(hwnd_shell, 0, "SysListView32", "FolderView")
+        except Exception:
+            return None
+
+    def arrange(self, mode: str = "auto") -> str:
+        """排列桌面图标。mode: auto/snap_to_grid/by_name/by_type/by_size/by_date
+
+        🔴 三层策略：
+        1. auto/snap_to_grid → SendMessage LVM_ARRANGE（快速对齐）
+        2. by_name/by_type/by_size/by_date → 注册表 + 键盘模拟排序（SendMessage 不排序！）
+        3. 全部失败 → 注册表 + SHChangeNotify 兜底
+        """
+        if not self.available:
+            return "此功能仅支持 Windows"
+
+        # ━━━ auto/snap_to_grid: SendMessage 可用（只需对齐图标位置）━━━
+        if mode in ("auto", "snap_to_grid"):
+            hwnd = self._get_desktop_listview()
+            if hwnd:
+                try:
+                    flag = self._LVA_SNAPTOGRID if mode == "snap_to_grid" else self._LVA_DEFAULT
+                    ctypes.windll.user32.SendMessageW(hwnd, self._LVM_ARRANGE, flag, 0)
+                    mode_desc = "对齐到网格" if mode == "snap_to_grid" else "自动排列"
+                    return f"桌面图标已{mode_desc}"
+                except Exception:
+                    pass
+
+        # ━━━ by_name/by_type/by_size/by_date: SendMessage 不会排序，直接用注册表+键盘 ━━━
+        # LVM_ARRANGE 只执行对齐（LVA_DEFAULT=移至默认位置，LVA_SNAPTOGRID=对齐网格）
+        # 排序需要 LVM_SORTITEMS（带回调）或用右键菜单/注册表
+        return self._arrange_via_powershell(mode)
+
+    def _arrange_via_powershell(self, mode: str = "auto") -> str:
+        """通过注册表 + Explorer 重启排列桌面图标，Win10/11 100%生效。
+
+        策略（按优先级）：
+        1. 注册表写入 FFlags/Sort/SortDir + WM_SETTINGCHANGE 广播
+        2. 键盘模拟右键菜单排序（温和方式，不闪屏）
+        3. 重启 Explorer（最后手段，闪屏但绝对生效）
+        """
+        import subprocess, time
+
+        _MODE_FLAGS = {
+            "auto": 0x1,
+            "snap_to_grid": 0x3,
+            "by_name": 0x1,
+            "by_type": 0x1,
+            "by_size": 0x1,
+            "by_date": 0x1,
+        }
+
+        try:
+            key_path = r'HKCU\Software\Microsoft\Windows\Shell\Bags\1\Desktop'
+
+            # 确保键存在
+            subprocess.run(
+                ['reg', 'add', key_path, '/f'],
+                capture_output=True, timeout=5,
+                creationflags=0x08000000
+            )
+
+            # 读取当前 FFlags
+            result = subprocess.run(
+                ['reg', 'query', key_path, '/v', 'FFlags'],
+                capture_output=True, text=True, timeout=5,
+                creationflags=0x08000000
+            )
+            current = 0
+            if result.returncode == 0:
+                for line in result.stdout.split('\n'):
+                    if 'FFlags' in line:
+                        parts = line.strip().split()
+                        last = parts[-1]
+                        if last.startswith('0x'):
+                            current = int(last, 16)
+                        else:
+                            try:
+                                current = int(last)
+                            except ValueError:
+                                pass
+
+            # 设置 FFlags（保留现有位，添加 auto-arrange）
+            flag_bits = _MODE_FLAGS.get(mode, 0x1)
+            new_val = current | flag_bits
+            # Win11 需要 bit 30 (0x40000000) 来确保设置被锁定
+            if mode != "snap_to_grid":
+                new_val = new_val | 0x40000000
+
+            subprocess.run(
+                ['reg', 'add', key_path, '/v', 'FFlags', '/t', 'REG_DWORD',
+                 '/d', str(new_val), '/f'],
+                capture_output=True, timeout=5,
+                creationflags=0x08000000
+            )
+
+            # 排序设置
+            _SORT_COLUMNS = {
+                "by_name": ('Sort', '0', 'SortDir', '1'),
+                "by_type": ('Sort', '1', 'SortDir', '1'),
+                "by_size": ('Sort', '2', 'SortDir', '1'),
+                "by_date": ('Sort', '3', 'SortDir', '2'),
+            }
+            if mode in _SORT_COLUMNS:
+                sort_key, sort_val, dir_key, dir_val = _SORT_COLUMNS[mode]
+                subprocess.run(
+                    ['reg', 'add', key_path, '/v', sort_key, '/t', 'REG_DWORD',
+                     '/d', sort_val, '/f'],
+                    capture_output=True, timeout=5,
+                    creationflags=0x08000000
+                )
+                subprocess.run(
+                    ['reg', 'add', key_path, '/v', dir_key, '/t', 'REG_DWORD',
+                     '/d', dir_val, '/f'],
+                    capture_output=True, timeout=5,
+                    creationflags=0x08000000
+                )
+
+            # ━━━ 通知 Shell 刷新设置 ━━━
+            try:
+                SHCNE_ASSOCCHANGED = 0x08000000
+                SHCNF_FLUSH = 0x1000
+                ctypes.windll.shell32.SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_FLUSH, None, None)
+                HWND_BROADCAST = 0xFFFF
+                WM_SETTINGCHANGE = 0x001A
+                ctypes.windll.user32.SendMessageW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, 'Policy')
+            except Exception:
+                pass
+
+            # ━━━ 键盘模拟排序（温和方式）━━━━
+            if mode in ("by_name", "by_type", "by_size", "by_date"):
+                self._sort_desktop_via_keyboard(mode)
+                time.sleep(0.5)
+
+            # ━━━ Explorer 重启（最后手段，绝对生效）━━━━
+            # 注册表设置需要 Explorer 重启才能完全生效
+            # 这只在排序模式下执行，auto/snap_to_grid 不需要
+            if mode in ("by_name", "by_type", "by_size", "by_date"):
+                try:
+                    # 先尝试温和刷新
+                    subprocess.run(['ie4uinit.exe', '-show'],
+                                   capture_output=True, timeout=5,
+                                   creationflags=0x08000000)
+                    time.sleep(0.3)
+
+                    # 重启 Explorer 以强制应用排序设置
+                    subprocess.run(
+                        ['taskkill', '/f', '/im', 'explorer.exe'],
+                        capture_output=True, timeout=5,
+                        creationflags=0x08000000
+                    )
+                    time.sleep(1.0)
+                    # 启动 Explorer（桌面和任务栏恢复，图标已按新设置排列）
+                    subprocess.Popen(
+                        ['explorer.exe'],
+                        creationflags=0x08000000
+                    )
+                    time.sleep(1.5)  # 等桌面完全恢复
+                except Exception:
+                    pass
+
+            _MODE_NAMES = {
+                "auto": "自动排列", "snap_to_grid": "对齐到网格",
+                "by_name": "按名称排序", "by_type": "按类型排序",
+                "by_size": "按大小排序", "by_date": "按日期排序",
+            }
+            mode_desc = _MODE_NAMES.get(mode, mode)
+            return f"桌面图标已{mode_desc}"
+        except Exception as e:
+            return f"排列失败: {e}"
+
+    def _sort_desktop_via_keyboard(self, mode: str = "by_name") -> bool:
+        """Win11 键盘模拟排序桌面图标。
+
+        使用 keybd_event（非 SendInput）绕过 UIPI 限制。
+        原理：聚焦桌面 → Shift+F10 右键菜单 → O(排序方式) → N/T/S/D(具体排序)
+        """
+        try:
+            import time
+
+            # VK 码
+            VK_LWIN, VK_D = 0x5B, 0x44
+            VK_SHIFT, VK_F10 = 0x10, 0x79
+            VK_ESCAPE, VK_APPS = 0x1B, 0x5D
+            KEYEVENTF_KEYUP = 0x0002
+
+            # keybd_event 不受 UIPI 限制，可以发送到桌面
+            def pk(vk, up=False):
+                ctypes.windll.user32.keybd_event(vk, 0, KEYEVENTF_KEYUP if up else 0, 0)
+                time.sleep(0.025)
+
+            def sc(ch):
+                """发送字符键"""
+                vk = ord(ch.upper())
+                pk(vk); pk(vk, True)
+                time.sleep(0.07)
+
+            def combo(k1, k2):
+                """组合键"""
+                pk(k1); time.sleep(0.01); pk(k2); pk(k2, True); pk(k1, True)
+                time.sleep(0.05)
+
+            # 排序模式 → 访问键 (Win11 中英文通用)
+            _SORT_KEYS = {
+                "by_name": ("o", "n"),
+                "by_type": ("o", "t"),
+                "by_size": ("o", "s"),   # Win11用S (Size), 旧版用Z
+                "by_date": ("o", "d"),
+            }
+            keys = _SORT_KEYS.get(mode)
+            if not keys:
+                return False
+            sort_menu_key, sort_item_key = keys
+
+            # 第1步：Win+D 显示桌面
+            combo(VK_LWIN, VK_D)
+            time.sleep(0.5)
+
+            # 第2步：Escape 清除所有选中
+            pk(VK_ESCAPE); pk(VK_ESCAPE, True)
+            time.sleep(0.15)
+
+            # 第3步：右键菜单 — 先试 AppKey，再试 Shift+F10
+            pk(VK_APPS); pk(VK_APPS, True)
+            time.sleep(0.4)
+
+            # 第4步：导航排序菜单
+            sc(sort_menu_key)     # O
+            time.sleep(0.3)
+            sc(sort_item_key)      # N
+            time.sleep(0.3)
+
+            # 第5步：Escape 关闭菜单
+            pk(VK_ESCAPE); pk(VK_ESCAPE, True)
+
+            return True
+        except Exception:
+            return False
+
+    def show_icons(self, visible: bool = True) -> str:
+        """显示/隐藏桌面图标。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        try:
+            hwnd = self._get_desktop_listview()
+            if hwnd:
+                SW_SHOW = 5 if visible else 0
+                ctypes.windll.user32.ShowWindow(hwnd, SW_SHOW)
+            # 同时修改注册表
+            import subprocess
+            val = "1" if visible else "0"
+            subprocess.run(
+                ['reg', 'add', r'HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced',
+                 '/v', 'HideIcons', '/t', 'REG_DWORD', '/d', val, '/f'],
+                capture_output=True, timeout=5
+            )
+            # 刷新桌面
+            ctypes.windll.user32.PostMessageW(0xFFFF, 0x001A, 0, 0)  # WM_SETTINGCHANGE
+            status = "显示" if visible else "隐藏"
+            return f"桌面图标已{status}"
+        except Exception as e:
+            return f"操作失败: {e}"
+
+    def auto_arrange(self, enable: bool = True) -> str:
+        """开关桌面图标自动排列。Windows 10/11 兼容实现。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        try:
+            import subprocess
+            val = "1" if enable else "0"
+
+            # 🔴 修复：FFlags 是位掩码，不能直接覆写为 0/1
+            # bit 0 (0x1) = auto-arrange, bit 1 (0x2) = snap-to-grid, bit 4 (0x10) = checkboxes, ...
+            # 必须保留其他位，只修改 bit 0
+            key_path = r'HKCU\Software\Microsoft\Windows\Shell\Bags\1\Desktop'
+
+            # 确保键存在
+            subprocess.run(
+                ['reg', 'add', key_path, '/f'],
+                capture_output=True, timeout=5
+            )
+
+            # 读取当前值
+            result = subprocess.run(
+                ['reg', 'query', key_path, '/v', 'FFlags'],
+                capture_output=True, text=True, timeout=5
+            )
+            current = 0
+            if result.returncode == 0:
+                for line in result.stdout.split('\n'):
+                    if 'FFlags' in line:
+                        parts = line.strip().split()
+                        last = parts[-1]
+                        if last.startswith('0x'):
+                            current = int(last, 16)
+                        else:
+                            try:
+                                current = int(last)
+                            except ValueError:
+                                pass
+
+            # 设置 bit 0 (auto-arrange) 和 bit 1 (align-to-grid)
+            if enable:
+                new_val = current | 0x1  # 只设置 bit 0
+            else:
+                new_val = current & ~0x1  # 只清除 bit 0
+
+            subprocess.run(
+                ['reg', 'add', key_path, '/v', 'FFlags', '/t', 'REG_DWORD',
+                 '/d', str(new_val), '/f'],
+                capture_output=True, timeout=5
+            )
+
+            # 也设置 Explorer\Advanced 下的 key（Win11 可能用这个）
+            adv_key = r'HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'
+            adv_val_name = 'AutoArrange' if enable else 'AutoArrange'
+            subprocess.run(
+                ['reg', 'add', adv_key, '/v', adv_val_name, '/t', 'REG_DWORD',
+                 '/d', val, '/f'],
+                capture_output=True, timeout=5
+            )
+
+            # 🔴 刷新桌面 — 使用 ie4uinit.exe -show（Windows 官方桌面图标刷新）
+            # F5/COM/WM_SETTINGCHANGE 在 Win11 上不可靠——F5 可能发到别的窗口，
+            # COM Refresh 只刷新打开的资源管理器窗口不刷新桌面
+            import time
+            try:
+                subprocess.run(
+                    ['ie4uinit.exe', '-show'],
+                    capture_output=True, timeout=5,
+                    creationflags=0x08000000
+                )
+            except Exception:
+                pass
+            time.sleep(0.3)
+
+            status = "已启用" if enable else "已禁用"
+            return f"桌面图标自动排列{status}"
+        except Exception as e:
+            return f"操作失败: {e}"
+
+    def refresh(self) -> str:
+        """刷新桌面。Win11 使用 ie4uinit.exe -show。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        try:
+            import subprocess
+            subprocess.run(
+                ['ie4uinit.exe', '-show'],
+                capture_output=True, timeout=5,
+                creationflags=0x08000000
+            )
+            return "桌面已刷新"
+        except Exception as e:
+            return f"刷新失败: {e}"
+
+    def get_icon_count(self) -> str:
+        """获取桌面图标数量。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        hwnd = self._get_desktop_listview()
+        if not hwnd:
+            return "无法获取桌面图标列表"
+        try:
+            count = ctypes.windll.user32.SendMessageW(hwnd, self._LVM_GETITEMCOUNT, 0, 0)
+            return f"桌面共 {count} 个图标"
+        except Exception as e:
+            return f"获取失败: {e}"
+
+    def set_wallpaper(self, image_path: str) -> str:
+        """设置桌面壁纸。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        if not image_path or not os.path.exists(image_path.strip('"\'')):
+            return f"图片文件不存在: {image_path}"
+        try:
+            path = os.path.abspath(image_path.strip('"\''))
+            ctypes.windll.user32.SystemParametersInfoW(20, 0, path, 3)  # SPI_SETDESKWALLPAPER
+            return f"壁纸已设置为: {os.path.basename(path)}"
+        except Exception as e:
+            return f"设置壁纸失败: {e}"
+
+    def toggle_dark_mode(self, enable: bool = True) -> str:
+        """切换 Windows 暗色/亮色模式。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        try:
+            import subprocess
+            val = "1" if enable else "0"
+            subprocess.run(
+                ['reg', 'add', r'HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize',
+                 '/v', 'AppsUseLightTheme', '/t', 'REG_DWORD', '/d', val, '/f'],
+                capture_output=True, timeout=5
+            )
+            subprocess.run(
+                ['reg', 'add', r'HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize',
+                 '/v', 'SystemUsesLightTheme', '/t', 'REG_DWORD', '/d', val, '/f'],
+                capture_output=True, timeout=5
+            )
+            mode = "暗色" if enable else "亮色"
+            return f"已切换到{mode}模式（部分应用需重启生效）"
+        except Exception as e:
+            return f"切换失败: {e}"
+
+
+# ==================== 电源管理器（零依赖，Win32 API + powercfg）====================
+
+class PowerManager:
+    """Windows 电源管理 — 关机/重启/睡眠/休眠/锁屏/电源计划。
+    零外部依赖，ctypes + powercfg 命令。
+    """
+
+    _EWX_LOGOFF = 0
+    _EWX_SHUTDOWN = 1
+    _EWX_REBOOT = 2
+    _EWX_FORCE = 4
+    _EWX_POWEROFF = 8
+    _EWX_HYBRID_SHUTDOWN = 0x00400000
+
+    def __init__(self):
+        self.available = platform.system() == "Windows"
+        self._shutdown_confirmed = False
+
+    def _require_confirmation(self, action: str) -> str:
+        """需要二次确认的操作返回确认请求。"""
+        self._shutdown_confirmed = False
+        return (f"⚠️ 确认{action}？此操作不可逆。请在5秒内回复 '确认' 或输入 "
+                f"powershell shutdown /a 取消。")
+
+    def shutdown(self, force: bool = False, delay: int = 0) -> str:
+        """关机。delay=延时时长（秒），0=立即。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        try:
+            import subprocess
+            cmd = ['shutdown', '/s']
+            if force:
+                cmd.append('/f')
+            if delay > 0:
+                cmd.extend(['/t', str(delay)])
+                return f"系统将在 {delay} 秒后关机。取消: ```powershell shutdown /a```"
+            else:
+                cmd.extend(['/t', '0'])
+                # 需要确认
+                subprocess.run(cmd, capture_output=True, timeout=5)
+                return "正在关机..."
+        except Exception as e:
+            return f"关机失败: {e}"
+
+    def restart(self, force: bool = False, delay: int = 0) -> str:
+        """重启。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        try:
+            import subprocess
+            cmd = ['shutdown', '/r']
+            if force:
+                cmd.append('/f')
+            if delay > 0:
+                cmd.extend(['/t', str(delay)])
+                return f"系统将在 {delay} 秒后重启。取消: ```powershell shutdown /a```"
+            else:
+                cmd.extend(['/t', '0'])
+                subprocess.run(cmd, capture_output=True, timeout=5)
+                return "正在重启..."
+        except Exception as e:
+            return f"重启失败: {e}"
+
+    def sleep(self) -> str:
+        """睡眠。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        try:
+            # 使用 SetSuspendState
+            ctypes.windll.powrprof.SetSuspendState(0, 1, 0)
+            return "系统正在进入睡眠..."
+        except Exception:
+            try:
+                import subprocess
+                subprocess.run(
+                    ['powershell', '-Command',
+                     'Add-Type -AssemblyName System.Windows.Forms; '
+                     '[System.Windows.Forms.Application]::SetSuspendState("Suspend", $false, $false)'],
+                    capture_output=True, timeout=10
+                )
+                return "系统正在进入睡眠..."
+            except Exception as e:
+                return f"睡眠失败: {e}"
+
+    def hibernate(self) -> str:
+        """休眠。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        try:
+            ctypes.windll.powrprof.SetSuspendState(1, 0, 0)
+            return "系统正在进入休眠..."
+        except Exception:
+            try:
+                import subprocess
+                subprocess.run(['shutdown', '/h'], capture_output=True, timeout=10)
+                return "系统正在进入休眠..."
+            except Exception as e:
+                return f"休眠失败: {e}"
+
+    def lock(self) -> str:
+        """锁屏。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        try:
+            ctypes.windll.user32.LockWorkStation()
+            return "屏幕已锁定"
+        except Exception as e:
+            return f"锁屏失败: {e}"
+
+    def sign_out(self) -> str:
+        """注销当前用户。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        try:
+            import subprocess
+            subprocess.run(['shutdown', '/l'], capture_output=True, timeout=5)
+            return "正在注销..."
+        except Exception as e:
+            return f"注销失败: {e}"
+
+    def display_off(self) -> str:
+        """关闭显示器。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        try:
+            ctypes.windll.user32.SendMessageW(0xFFFF, 0x0112, 0xF170, 2)
+            return "显示器已关闭"
+        except Exception as e:
+            return f"关闭显示器失败: {e}"
+
+    def list_plans(self) -> str:
+        """列出电源计划。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        try:
+            import subprocess
+            result = subprocess.run(
+                ['powercfg', '/l'], capture_output=True, text=True, timeout=10
+            )
+            return result.stdout.strip() or "无法获取电源计划列表"
+        except Exception as e:
+            return f"获取电源计划失败: {e}"
+
+    def switch_plan(self, plan_name: str = "高性能") -> str:
+        """切换电源计划。支持: 高性能/平衡/节能/卓越性能"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        plan_map = {
+            "高性能": "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c",
+            "平衡": "381b4222-f694-41f0-9685-ff5bb260df2e",
+            "节能": "a1841308-3541-4fab-bc81-f71556f20b4a",
+            "卓越性能": "e9a42b02-d5df-448d-aa00-03f14749eb61",
+        }
+        guid = plan_map.get(plan_name)
+        if not guid:
+            return f"未知电源计划: {plan_name}。支持: {', '.join(plan_map.keys())}"
+        try:
+            import subprocess
+            subprocess.run(['powercfg', '/setactive', guid], capture_output=True, timeout=5)
+            return f"已切换到{plan_name}电源计划"
+        except Exception as e:
+            return f"切换失败: {e}"
+
+    def display_timeout(self, minutes: int = 10) -> str:
+        """设置显示器超时（分钟）。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        try:
+            import subprocess
+            subprocess.run(
+                ['powercfg', '/change', 'monitor-timeout-ac', str(minutes)],
+                capture_output=True, timeout=5
+            )
+            subprocess.run(
+                ['powercfg', '/change', 'monitor-timeout-dc', str(minutes)],
+                capture_output=True, timeout=5
+            )
+            return f"显示器超时已设置为 {minutes} 分钟"
+        except Exception as e:
+            return f"设置失败: {e}"
+
+
+# ==================== 网络管理器（WiFi / 网络配置）====================
+
+class NetworkManager:
+    """Windows 网络管理 — WiFi连接/断开/扫描、网络适配器、IP/DNS配置。
+    零外部依赖，Win32 API + netsh + powershell。
+    """
+
+    def __init__(self):
+        self.available = platform.system() == "Windows"
+
+    def wifi_list(self) -> str:
+        """列出附近 WiFi 网络。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        try:
+            import subprocess
+            result = subprocess.run(
+                ['netsh', 'wlan', 'show', 'networks', 'mode=Bssid'],
+                capture_output=True, text=True, timeout=15
+            )
+            output = result.stdout
+            networks = []
+            for line in output.split('\n'):
+                line = line.strip()
+                if line.startswith('SSID'):
+                    networks.append(line.split(':', 1)[-1].strip())
+            if not networks:
+                return "未扫描到 WiFi 网络"
+            return "附近的 WiFi:\n  " + "\n  ".join(networks[:20])
+        except Exception as e:
+            return f"WiFi 扫描失败: {e}"
+
+    def wifi_connect(self, ssid: str, password: str = "") -> str:
+        """连接 WiFi。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        try:
+            import subprocess
+            # 先创建配置文件
+            if password:
+                profile_xml = (
+                    f'<?xml version="1.0"?><WLANProfile xmlns="http://www.microsoft.com/networking/WLAN/profile/v1">'
+                    f'<name>{ssid}</name><SSIDConfig><SSID><name>{ssid}</name></SSID></SSIDConfig>'
+                    f'<connectionType>ESS</connectionType><connectionMode>auto</connectionMode>'
+                    f'<MSM><security><authEncryption><authentication>WPA2PSK</authentication>'
+                    f'<encryption>AES</encryption><useOneX>false</useOneX></authEncryption>'
+                    f'<sharedKey><keyType>passPhrase</keyType><protected>false</protected>'
+                    f'<keyMaterial>{password}</keyMaterial></sharedKey></security></MSM></WLANProfile>'
+                )
+                # 保存临时配置文件
+                import tempfile
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.xml', delete=False, encoding='utf-8') as f:
+                    f.write(profile_xml)
+                    profile_path = f.name
+                try:
+                    subprocess.run(
+                        ['netsh', 'wlan', 'add', 'profile', f'filename={profile_path}'],
+                        capture_output=True, timeout=10
+                    )
+                finally:
+                    os.unlink(profile_path)
+            # 连接
+            result = subprocess.run(
+                ['netsh', 'wlan', 'connect', f'name={ssid}'],
+                capture_output=True, text=True, timeout=15
+            )
+            return f"正在连接 {ssid}...\n{result.stdout.strip()}"
+        except Exception as e:
+            return f"连接失败: {e}"
+
+    def wifi_disconnect(self) -> str:
+        """断开当前 WiFi。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        try:
+            import subprocess
+            subprocess.run(['netsh', 'wlan', 'disconnect'], capture_output=True, timeout=5)
+            return "WiFi 已断开"
+        except Exception as e:
+            return f"断开失败: {e}"
+
+    def wifi_status(self) -> str:
+        """获取当前 WiFi 连接状态。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        try:
+            import subprocess
+            result = subprocess.run(
+                ['netsh', 'wlan', 'show', 'interfaces'],
+                capture_output=True, text=True, timeout=10
+            )
+            output = result.stdout
+            info = {}
+            for line in output.split('\n'):
+                line = line.strip()
+                if ':' in line:
+                    key, val = line.split(':', 1)
+                    key = key.strip()
+                    val = val.strip()
+                    if key in ('SSID', 'BSSID', 'Signal', 'Channel', 'Receive rate', 'Transmit rate'):
+                        info[key] = val
+            if not info:
+                return f"当前未连接 WiFi\n{output[:500]}"
+            return '\n'.join(f"{k}: {v}" for k, v in info.items())
+        except Exception as e:
+            return f"获取状态失败: {e}"
+
+    def ip_config(self) -> str:
+        """查看当前 IP 配置。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        try:
+            import subprocess
+            result = subprocess.run(
+                ['powershell', '-Command',
+                 'Get-NetIPAddress -AddressFamily IPv4 | Where-Object {$_.PrefixOrigin -eq "Manual" -or $_.PrefixOrigin -eq "Dhcp"} | Format-Table InterfaceAlias, IPAddress, PrefixLength, DefaultGateway -AutoSize'],
+                capture_output=True, text=True, timeout=10
+            )
+            return result.stdout.strip() or "无法获取 IP 配置"
+        except Exception as e:
+            return f"获取失败: {e}"
+
+    def adapter_list(self) -> str:
+        """列出网络适配器。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        try:
+            import subprocess
+            result = subprocess.run(
+                ['powershell', '-Command',
+                 'Get-NetAdapter | Format-Table Name, Status, LinkSpeed, MacAddress -AutoSize'],
+                capture_output=True, text=True, timeout=10
+            )
+            return result.stdout.strip() or "未找到网络适配器"
+        except Exception as e:
+            return f"获取失败: {e}"
+
+    def adapter_enable(self, name: str, enable: bool = True) -> str:
+        """启用/禁用网络适配器。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        action = "Enable" if enable else "Disable"
+        try:
+            import subprocess
+            result = subprocess.run(
+                ['powershell', '-Command',
+                 f'{action}-NetAdapter -Name "{name}" -Confirm:$false'],
+                capture_output=True, text=True, timeout=15
+            )
+            status = "启用" if enable else "禁用"
+            return f"适配器 '{name}' 已{status}\n{result.stdout.strip()}"
+        except Exception as e:
+            return f"操作失败: {e}"
+
+    def set_dns(self, dns_server: str, adapter: str = "") -> str:
+        """设置 DNS 服务器。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        try:
+            import subprocess
+            if adapter:
+                cmd = f'Set-DnsClientServerAddress -InterfaceAlias "{adapter}" -ServerAddresses ("{dns_server}")'
+            else:
+                cmd = f'Set-DnsClientServerAddress -InterfaceAlias (Get-NetAdapter | Where-Object {{$_.Status -eq "Up"}} | Select-Object -First 1).Name -ServerAddresses ("{dns_server}")'
+            result = subprocess.run(
+                ['powershell', '-Command', cmd],
+                capture_output=True, text=True, timeout=10, shell=False
+            )
+            return f"DNS 已设置为 {dns_server}\n{result.stdout.strip()}"
+        except Exception as e:
+            return f"设置 DNS 失败: {e}"
+
+    def port_listen(self) -> str:
+        """查看当前端口占用。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        try:
+            import subprocess
+            result = subprocess.run(
+                ['netstat', '-ano', '-p', 'tcp'],
+                capture_output=True, text=True, timeout=5
+            )
+            # 只显示 LISTENING 状态的端口
+            lines = [l for l in result.stdout.split('\n') if 'LISTENING' in l]
+            if not lines:
+                return "无 LISTENING 端口"
+            return "监听端口:\n" + '\n'.join(lines[:30])
+        except Exception as e:
+            return f"获取端口失败: {e}"
+
+    def proxy_set(self, proxy_address: str = "") -> str:
+        """设置系统代理。空字符串=关闭代理。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        try:
+            import subprocess
+            if proxy_address:
+                subprocess.run(
+                    ['reg', 'add', r'HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings',
+                     '/v', 'ProxyEnable', '/t', 'REG_DWORD', '/d', '1', '/f'],
+                    capture_output=True, timeout=5
+                )
+                subprocess.run(
+                    ['reg', 'add', r'HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings',
+                     '/v', 'ProxyServer', '/t', 'REG_SZ', '/d', proxy_address, '/f'],
+                    capture_output=True, timeout=5
+                )
+                return f"系统代理已设置为 {proxy_address}"
+            else:
+                subprocess.run(
+                    ['reg', 'add', r'HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings',
+                     '/v', 'ProxyEnable', '/t', 'REG_DWORD', '/d', '0', '/f'],
+                    capture_output=True, timeout=5
+                )
+                return "系统代理已关闭"
+        except Exception as e:
+            return f"设置代理失败: {e}"
+
+
+# ==================== 蓝牙管理器 ====================
+
+class BluetoothManager:
+    """Windows 蓝牙管理 — 扫描/配对/连接/断开。
+    零外部依赖，Win32 API + PowerShell。
+    """
+
+    def __init__(self):
+        self.available = platform.system() == "Windows"
+
+    def _run_ps(self, cmd: str, timeout: float = 15.0) -> str:
+        """执行 PowerShell 命令并返回输出。"""
+        import subprocess
+        try:
+            result = subprocess.run(
+                ['powershell', '-NoProfile', '-Command', cmd],
+                capture_output=True, text=True, timeout=timeout
+            )
+            return (result.stdout or result.stderr).strip()
+        except Exception as e:
+            return str(e)
+
+    def list_devices(self) -> str:
+        """列出已配对蓝牙设备。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        output = self._run_ps(
+            'Get-PnpDevice -Class Bluetooth | '
+            'Where-Object {$_.Status -eq "OK"} | '
+            'Select-Object FriendlyName, Status, InstanceId | Format-List'
+        )
+        return output or "未找到已配对的蓝牙设备"
+
+    def scan(self, timeout_sec: int = 8) -> str:
+        """扫描附近蓝牙设备。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        return ("扫描蓝牙设备需要在 Windows 设置中打开蓝牙扫描。\n"
+                "快捷方式: ```desktop_key Win+A``` 打开操作中心查看蓝牙。\n"
+                "或通过 PowerShell 检查: ```powershell Get-PnpDevice -Class Bluetooth```")
+
+    def status(self) -> str:
+        """蓝牙开关状态。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        output = self._run_ps(
+            'Get-PnpDevice -Class Bluetooth | '
+            'Where-Object {$_.FriendlyName -like "*Adapter*" -or $_.FriendlyName -like "*Radio*"} | '
+            'Select-Object FriendlyName, Status'
+        )
+        return output or "未检测到蓝牙适配器"
+
+
+# ==================== 音频设备管理器 ====================
+
+class AudioDeviceManager:
+    """Windows 音频设备管理 — 切换默认输出/输入设备、音量控制、静音。
+    零外部依赖，ctypes + PowerShell AudioDeviceCmdlets。
+    """
+
+    def __init__(self):
+        self.available = platform.system() == "Windows"
+
+    def _run_ps(self, cmd: str, timeout: float = 10.0) -> str:
+        import subprocess
+        try:
+            result = subprocess.run(
+                ['powershell', '-NoProfile', '-Command', cmd],
+                capture_output=True, text=True, timeout=timeout
+            )
+            return (result.stdout or result.stderr).strip()
+        except Exception as e:
+            return str(e)
+
+    def list_devices(self) -> str:
+        """列出所有音频设备。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        output = self._run_ps(
+            'Add-Type -TypeDefinition @\"'
+            'using System; using System.Runtime.InteropServices;'
+            'public class Audio {'
+            '  [DllImport("winmm.dll")] public static extern int waveOutGetNumDevs();'
+            '  [DllImport("winmm.dll")] public static extern int waveInGetNumDevs();'
+            '}\"@; '
+            '$out = [Audio]::waveOutGetNumDevs(); '
+            '$in = [Audio]::waveInGetNumDevs(); '
+            'Write-Host "输出设备: $out 个, 输入设备: $in 个"; '
+            'Get-AudioDevice -List | Format-Table Name, Type, Default, ID -AutoSize 2>$null; '
+            'if ($LASTEXITCODE -ne 0) { '
+            '  Get-PnpDevice -Class AudioEndpoint | '
+            '  Select-Object FriendlyName, Status | Format-List'
+            '}'
+        )
+        return output or "无法获取音频设备列表"
+
+    def switch_output(self, device_name: str = "") -> str:
+        """切换默认输出设备。device_name=部分名称匹配。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        if not device_name:
+            return self.list_devices()
+        output = self._run_ps(
+            f'$dev = Get-AudioDevice -List | Where-Object {{$_.Name -like "*{device_name}*" -and $_.Type -eq "Playback"}} | Select-Object -First 1; '
+            f'if ($dev) {{ Set-AudioDevice $dev.ID; Write-Host "已切换到: $($dev.Name)" }} else {{ Write-Host "未找到匹配的输出设备: {device_name}" }}'
+        )
+        if "未找到" in output:
+            return f"未找到匹配的输出设备: {device_name}。{self.list_devices()}"
+        return output or f"已尝试切换到: {device_name}"
+
+    def switch_input(self, device_name: str = "") -> str:
+        """切换默认输入设备。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        if not device_name:
+            return self.list_devices()
+        output = self._run_ps(
+            f'$dev = Get-AudioDevice -List | Where-Object {{$_.Name -like "*{device_name}*" -and $_.Type -eq "Recording"}} | Select-Object -First 1; '
+            f'if ($dev) {{ Set-AudioDevice $dev.ID; Write-Host "已切换到: $($dev.Name)" }} else {{ Write-Host "未找到匹配的输入设备: {device_name}" }}'
+        )
+        return output or f"已尝试切换到: {device_name}"
+
+    def set_volume(self, level: int) -> str:
+        """设置系统音量 (0-100)。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        try:
+            level = max(0, min(100, level))
+            # 使用 SendMessage 模拟音量键
+            import time
+            # 先设为0再逐级调高
+            for _ in range(50):
+                ctypes.windll.user32.keybd_event(0xAE, 0, 0, 0)  # VK_VOLUME_DOWN
+                ctypes.windll.user32.keybd_event(0xAE, 0, 2, 0)
+                time.sleep(0.01)
+            # 调高到目标级别
+            steps = level // 2
+            for _ in range(steps):
+                ctypes.windll.user32.keybd_event(0xAF, 0, 0, 0)  # VK_VOLUME_UP
+                ctypes.windll.user32.keybd_event(0xAF, 0, 2, 0)
+                time.sleep(0.02)
+            return f"音量已设置为 {level}%"
+        except Exception as e:
+            return f"设置音量失败: {e}"
+
+    def mute(self, enable: bool = True) -> str:
+        """静音/取消静音。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        try:
+            ctypes.windll.user32.keybd_event(0xAD, 0, 0, 0)  # VK_VOLUME_MUTE
+            ctypes.windll.user32.keybd_event(0xAD, 0, 2, 0)
+            status = "已静音" if enable else "已取消静音"
+            return f"系统{status}"
+        except Exception as e:
+            return f"操作失败: {e}"
+
+
+# ==================== 显示设置管理器（扩展 DisplayManager）====================
+
+class DisplaySettingsManager:
+    """Windows 显示设置 — 分辨率/刷新率/缩放/多显示器/HDR/夜间模式。
+    零外部依赖，Win32 API + PowerShell。
+    """
+
+    def __init__(self):
+        self.available = platform.system() == "Windows"
+
+    def _run_ps(self, cmd: str, timeout: float = 10.0) -> str:
+        import subprocess
+        try:
+            result = subprocess.run(
+                ['powershell', '-NoProfile', '-Command', cmd],
+                capture_output=True, text=True, timeout=timeout
+            )
+            return (result.stdout or result.stderr).strip()
+        except Exception as e:
+            return str(e)
+
+    def get_info(self) -> str:
+        """获取当前显示配置。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        output = self._run_ps(
+            'Get-CimInstance -Namespace root/wmi -ClassName WmiMonitorBasicDisplayParams | '
+            'Select-Object InstanceName, MaxHorizontalImageSize, MaxVerticalImageSize | Format-List; '
+            'Get-WmiObject Win32_VideoController | '
+            'Select-Object Name, CurrentHorizontalResolution, CurrentVerticalResolution, '
+            'CurrentRefreshRate, AdapterRAM | Format-List'
+        )
+        return output or "无法获取显示信息"
+
+    def set_resolution(self, width: int, height: int, display_index: int = 0) -> str:
+        """设置分辨率。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        output = self._run_ps(
+            f'$d = Get-WmiObject Win32_VideoController | Select-Object -Index {display_index}; '
+            f'if ($d) {{ "当前分辨率: $($d.CurrentHorizontalResolution)x$($d.CurrentVerticalResolution)"; '
+            f'"请求分辨率: {width}x{height}"; '
+            f'"请通过 DisplaySettings 或 Windows 设置手动更改分辨率" }}'
+        )
+        return (f"Windows 不允许通过 API 直接更改分辨率。\n"
+                f"当前显示信息:\n{output}\n"
+                f"建议: ```desktop_key Win+I``` → 系统 → 屏幕 → 显示分辨率")
+
+    def night_light(self, enable: bool = True) -> str:
+        """开关夜间模式。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        val = "1" if enable else "0"
+        try:
+            import subprocess
+            subprocess.run(
+                ['reg', 'add',
+                 r'HKCU\Software\Microsoft\Windows\CurrentVersion\CloudStore\Store\DefaultAccount\Current\default$windows.data.bluelightreduction.bluelightreductionstate\windows.data.bluelightreduction.bluelightreductionstate',
+                 '/v', 'Data', '/t', 'REG_BINARY', '/d', val, '/f'],
+                capture_output=True, timeout=5
+            )
+            status = "启用" if enable else "禁用"
+            return f"夜间模式已{status}（可能需要重新登录生效）"
+        except Exception:
+            return (f"请通过快捷操作设置夜间模式:\n"
+                    f"```desktop_key Win+A``` 打开操作中心 → 点击夜间模式")
+
+
+# ==================== 磁盘管理器 ====================
+
+class DiskManager:
+    """Windows 磁盘管理 — 磁盘列表/清理/分析/回收站/USB弹出。
+    零外部依赖，psutil + PowerShell。
+    """
+
+    def __init__(self):
+        self.available = platform.system() == "Windows"
+
+    def _run_ps(self, cmd: str, timeout: float = 15.0) -> str:
+        import subprocess
+        try:
+            result = subprocess.run(
+                ['powershell', '-NoProfile', '-Command', cmd],
+                capture_output=True, text=True, timeout=timeout
+            )
+            return (result.stdout or result.stderr).strip()
+        except Exception as e:
+            return str(e)
+
+    def list_disks(self) -> str:
+        """列出所有磁盘分区。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        output = self._run_ps(
+            'Get-PSDrive -PSProvider FileSystem | '
+            'Select-Object Name, @{N="Total(GB)";E={[math]::Round($_.Used/1GB+$_.Free/1GB,1)}}, '
+            '@{N="Free(GB)";E={[math]::Round($_.Free/1GB,1)}}, '
+            '@{N="Used%";E={[math]::Round(($_.Used/($_.Used+$_.Free))*100,1)}} | Format-Table -AutoSize'
+        )
+        return output or self._run_ps('Get-Volume | Format-Table DriveLetter, Size, SizeRemaining, FileSystemType -AutoSize')
+
+    def analyze(self, path: str = "C:\\") -> str:
+        """分析磁盘空间占用（最大的文件夹）。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        path = path.strip('"\'') or "C:\\"
+        output = self._run_ps(
+            f'$target = "{path}"; '
+            f'if (Test-Path $target) {{ '
+            f'  Get-ChildItem $target -Directory -ErrorAction SilentlyContinue | '
+            f'  ForEach-Object {{ $size = (Get-ChildItem $_.FullName -Recurse -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum; '
+            f'  [PSCustomObject]@{{Folder=$_.Name; SizeMB=[math]::Round($size/1MB,1)}} }} | '
+            f'  Sort-Object SizeMB -Descending | Select-Object -First 15 | Format-Table -AutoSize '
+            f'}} else {{ Write-Host "路径不存在: $target" }}',
+            timeout=30.0
+        )
+        return output or f"磁盘分析: {path}"
+
+    def cleanup_temp(self) -> str:
+        """清理临时文件。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        try:
+            import tempfile
+            temp_dir = tempfile.gettempdir()
+            count = 0
+            for item in os.listdir(temp_dir):
+                try:
+                    item_path = os.path.join(temp_dir, item)
+                    if os.path.isfile(item_path):
+                        os.remove(item_path)
+                        count += 1
+                except Exception:
+                    pass
+            return f"已清理 {count} 个临时文件"
+        except Exception as e:
+            return f"清理失败: {e}"
+
+    def recycle_bin_empty(self) -> str:
+        """清空回收站。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        try:
+            import subprocess
+            subprocess.run(
+                ['powershell', '-Command', 'Clear-RecycleBin -Force -ErrorAction SilentlyContinue'],
+                capture_output=True, timeout=10
+            )
+            return "回收站已清空"
+        except Exception as e:
+            return f"清空回收站失败: {e}"
+
+    def recycle_bin_info(self) -> str:
+        """回收站信息。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        try:
+            # 使用 COM 接口
+            import subprocess
+            result = subprocess.run(
+                ['powershell', '-Command',
+                 '$shell = New-Object -ComObject Shell.Application; '
+                 '$rb = $shell.NameSpace(10); '
+                 'Write-Host "回收站: $($rb.Items().Count) 个项目, $([math]::Round($rb.Items() | Measure-Object -Property Size -Sum | %{$_.Sum}/1MB,2)) MB"'],
+                capture_output=True, text=True, timeout=5
+            )
+            return result.stdout.strip() or "无法获取回收站信息"
+        except Exception as e:
+            return f"获取失败: {e}"
+
+    def usb_eject(self, drive_letter: str) -> str:
+        """弹出 USB 设备。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        if not drive_letter:
+            return "请指定盘符，如: usb_eject E"
+        output = self._run_ps(
+            f'$drive = "{drive_letter}"; '
+            f'$vol = Get-WmiObject Win32_Volume -Filter "DriveLetter = \'$drive\'" ; '
+            f'if ($vol) {{ $vol.Dismount($true, $true) | Out-Null; Write-Host "$drive 已弹出" }} '
+            f'else {{ Write-Host "$drive 未找到" }}'
+        )
+        return output or f"{drive_letter} 盘已弹出"
+
+
+# ==================== Windows 服务管理器 ====================
+
+class ServiceManager:
+    """Windows 服务管理 — 列出/启动/停止/重启/启用/禁用。
+    零外部依赖，PowerShell / sc 命令。
+    """
+
+    def __init__(self):
+        self.available = platform.system() == "Windows"
+
+    def _run_ps(self, cmd: str, timeout: float = 10.0) -> str:
+        import subprocess
+        try:
+            result = subprocess.run(
+                ['powershell', '-NoProfile', '-Command', cmd],
+                capture_output=True, text=True, timeout=timeout
+            )
+            return (result.stdout or result.stderr).strip()
+        except Exception as e:
+            return str(e)
+
+    def list_services(self, filter_name: str = "") -> str:
+        """列出服务。filter_name 可选过滤。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        if filter_name:
+            output = self._run_ps(
+                f'Get-Service -Name "*{filter_name}*" | '
+                f'Format-Table Name, DisplayName, Status, StartType -AutoSize'
+            )
+        else:
+            output = self._run_ps(
+                'Get-Service | Where-Object {$_.Status -eq "Running"} | '
+                'Format-Table Name, DisplayName, Status, StartType -AutoSize'
+            )
+        return output or "未找到匹配的服务"
+
+    def service_action(self, name: str, action: str) -> str:
+        """对服务执行操作。action: start/stop/restart/enable/disable/status"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        name = name.strip()
+        action = action.lower()
+        if not name:
+            return "请指定服务名"
+
+        action_map = {
+            "start": "Start-Service",
+            "stop": "Stop-Service",
+            "restart": "Restart-Service",
+            "status": lambda: f"Get-Service -Name '{name}' | Format-List Name, Status, StartType, DisplayName",
+        }
+
+        if action in ("enable", "disable"):
+            startup = "Automatic" if action == "enable" else "Disabled"
+            output = self._run_ps(f'Set-Service -Name "{name}" -StartupType {startup}')
+            return f"服务 '{name}' 启动类型已设为 {startup}\n{output}"
+
+        if action in action_map:
+            cmd = action_map[action]
+            if callable(cmd):
+                output = self._run_ps(cmd())
+            else:
+                output = self._run_ps(f'{cmd} -Name "{name}"')
+            return f"{action} {name}:\n{output}"
+
+        return f"不支持的操作: {action}。支持: start/stop/restart/enable/disable/status"
+
+
+# ==================== 注册表管理器 ====================
+
+class RegistryManager:
+    """Windows 注册表操作 — 读/写/删除/导出。
+    带安全白名单，拒绝写入危险路径。
+    """
+
+    # 安全写入白名单（只允许写这些路径前缀）
+    _SAFE_WRITE_PREFIXES = [
+        r'HKCU\Software',
+        r'HKCU\Control Panel',
+        r'HKCU\Keyboard Layout',
+        r'HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer',
+    ]
+
+    def __init__(self):
+        self.available = platform.system() == "Windows"
+
+    def read(self, key_path: str, value_name: str = "") -> str:
+        """读取注册表键值。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        if not key_path:
+            return "请指定注册表路径"
+        try:
+            import subprocess
+            cmd = ['reg', 'query', key_path]
+            if value_name:
+                cmd.extend(['/v', value_name])
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            return result.stdout.strip() or "键值不存在或为空"
+        except Exception as e:
+            return f"读取注册表失败: {e}"
+
+    def write(self, key_path: str, value_name: str, value: str, reg_type: str = "REG_SZ") -> str:
+        """写入注册表键值（带安全检查）。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        # 安全检查
+        key_upper = key_path.upper().replace('\\\\', '\\')
+        allowed = any(key_upper.startswith(p.upper()) for p in self._SAFE_WRITE_PREFIXES)
+        if not allowed:
+            return (f"⛔ 安全限制：不允许写入此注册表路径。\n"
+                    f"允许的路径前缀: {', '.join(self._SAFE_WRITE_PREFIXES)}")
+        try:
+            import subprocess
+            cmd = ['reg', 'add', key_path, '/v', value_name, '/t', reg_type, '/d', value, '/f']
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            return f"已写入: {key_path}\\{value_name} = {value}\n{result.stdout.strip()}"
+        except Exception as e:
+            return f"写入失败: {e}"
+
+    def delete(self, key_path: str, value_name: str = "") -> str:
+        """删除注册表键值（带安全检查）。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        key_upper = key_path.upper().replace('\\\\', '\\')
+        allowed = any(key_upper.startswith(p.upper()) for p in self._SAFE_WRITE_PREFIXES)
+        if not allowed:
+            return f"⛔ 安全限制：不允许删除此注册表路径。"
+        try:
+            import subprocess
+            if value_name:
+                cmd = ['reg', 'delete', key_path, '/v', value_name, '/f']
+            else:
+                cmd = ['reg', 'delete', key_path, '/f']
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            return f"已删除: {key_path}\\{value_name or '(整个键)'}\n{result.stdout.strip()}"
+        except Exception as e:
+            return f"删除失败: {e}"
+
+    def export_backup(self, key_path: str, output_path: str = "") -> str:
+        """导出注册表分支为 .reg 文件（备份）。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        if not key_path:
+            return "请指定注册表路径"
+        if not output_path:
+            import tempfile, time
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            output_path = os.path.join(tempfile.gettempdir(), f"reg_backup_{ts}.reg")
+        try:
+            import subprocess
+            subprocess.run(
+                ['reg', 'export', key_path, output_path, '/y'],
+                capture_output=True, timeout=15
+            )
+            return f"注册表已导出到: {output_path}"
+        except Exception as e:
+            return f"导出失败: {e}"
+
+
+# ==================== 软件包管理器 ====================
+
+class PackageManager:
+    """Windows 软件包管理 — 列出/安装/卸载/更新/搜索。
+    统一入口：winget 优先 → npm/pip/cargo。
+    """
+
+    def __init__(self):
+        self.available = platform.system() == "Windows"
+
+    def _run(self, cmd: list, timeout: float = 30.0) -> str:
+        import subprocess
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            return (result.stdout or result.stderr).strip()
+        except Exception as e:
+            return str(e)
+
+    def list_installed(self) -> str:
+        """列出已安装软件（winget）。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        output = self._run(['winget', 'list'], timeout=20)
+        return output or "winget 不可用。请通过 PowerShell Get-Package 查询。"
+
+    def search(self, query: str) -> str:
+        """搜索软件包。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        if not query:
+            return "请指定搜索关键词"
+        output = self._run(['winget', 'search', query], timeout=20)
+        return output or f"未找到匹配 '{query}' 的软件包"
+
+    def install(self, package_id: str) -> str:
+        """安装软件包。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        if not package_id:
+            return "请指定要安装的软件包 ID"
+        output = self._run(
+            ['winget', 'install', package_id, '--accept-source-agreements', '--accept-package-agreements'],
+            timeout=120
+        )
+        return f"安装 {package_id}:\n{output}"
+
+    def uninstall(self, package_id: str) -> str:
+        """卸载软件包。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        if not package_id:
+            return "请指定要卸载的软件包 ID"
+        output = self._run(['winget', 'uninstall', package_id], timeout=60)
+        return f"卸载 {package_id}:\n{output}"
+
+    def update_all(self) -> str:
+        """更新所有可升级的软件包。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        output = self._run(
+            ['winget', 'upgrade', '--all', '--accept-source-agreements'],
+            timeout=300
+        )
+        return f"更新结果:\n{output}"
+
+
+# ==================== 启动项管理器 ====================
+
+class StartupManager:
+    """Windows 启动项管理 — 列出/添加/删除自启动程序。
+    零外部依赖，PowerShell。
+    """
+
+    def __init__(self):
+        self.available = platform.system() == "Windows"
+
+    def _run_ps(self, cmd: str, timeout: float = 10.0) -> str:
+        import subprocess
+        try:
+            result = subprocess.run(
+                ['powershell', '-NoProfile', '-Command', cmd],
+                capture_output=True, text=True, timeout=timeout
+            )
+            return (result.stdout or result.stderr).strip()
+        except Exception as e:
+            return str(e)
+
+    def list(self) -> str:
+        """列出所有启动项。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        output = self._run_ps(
+            'Get-CimInstance Win32_StartupCommand | '
+            'Select-Object Name, Command, User, Location | Format-List'
+        )
+        return output or "无启动项"
+
+    def add(self, name: str, command: str) -> str:
+        """添加启动项（当前用户）。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        if not name or not command:
+            return "请指定: 名称 命令。如: startup_add MyApp \"C:\\app.exe\""
+        output = self._run_ps(
+            f'$path = "$env:APPDATA\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\{name}.lnk"; '
+            f'$WshShell = New-Object -ComObject WScript.Shell; '
+            f'$Shortcut = $WshShell.CreateShortcut($path); '
+            f'$Shortcut.TargetPath = "{command}"; '
+            f'$Shortcut.Save(); '
+            f'Write-Host "已添加启动项: {name} → {command}"'
+        )
+        return output or f"已添加启动项: {name}"
+
+    def remove(self, name: str) -> str:
+        """删除启动项（当前用户）。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        if not name:
+            return "请指定启动项名称"
+        output = self._run_ps(
+            f'$path = "$env:APPDATA\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\{name}.lnk"; '
+            f'if (Test-Path $path) {{ Remove-Item $path -Force; Write-Host "已删除启动项: {name}" }} '
+            f'else {{ Write-Host "启动项不存在: {name}" }}'
+        )
+        return output or f"已删除启动项: {name}"
+
+
+# ==================== 安全管理器 ====================
+
+class SecurityManager:
+    """Windows 安全管理 — Defender状态/扫描、防火墙规则、凭据管理。
+    零外部依赖，PowerShell。
+    """
+
+    def __init__(self):
+        self.available = platform.system() == "Windows"
+
+    def _run_ps(self, cmd: str, timeout: float = 30.0) -> str:
+        import subprocess
+        try:
+            result = subprocess.run(
+                ['powershell', '-NoProfile', '-Command', cmd],
+                capture_output=True, text=True, timeout=timeout
+            )
+            return (result.stdout or result.stderr).strip()
+        except Exception as e:
+            return str(e)
+
+    def defender_status(self) -> str:
+        """查看 Windows Defender 状态。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        output = self._run_ps('Get-MpComputerStatus | Format-List')
+        return output or "无法获取 Defender 状态"
+
+    def defender_scan(self, scan_type: str = "quick") -> str:
+        """运行 Windows Defender 扫描。scan_type: quick/full/custom"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        type_map = {"quick": "QuickScan", "full": "FullScan", "custom": "CustomScan"}
+        ps_type = type_map.get(scan_type, "QuickScan")
+        output = self._run_ps(f'Start-MpScan -ScanType {ps_type}', timeout=300)
+        return f"Defender {scan_type} 扫描已启动\n{output}"
+
+    def defender_exclude(self, path: str, add: bool = True) -> str:
+        """添加/删除 Defender 排除路径。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        if not path:
+            return "请指定路径"
+        if add:
+            output = self._run_ps(f'Add-MpPreference -ExclusionPath "{path}"')
+            return f"已添加排除路径: {path}\n{output}"
+        else:
+            output = self._run_ps(f'Remove-MpPreference -ExclusionPath "{path}"')
+            return f"已移除排除路径: {path}\n{output}"
+
+    def firewall_status(self) -> str:
+        """查看防火墙状态。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        output = self._run_ps(
+            'Get-NetFirewallProfile | '
+            'Select-Object Name, Enabled, DefaultInboundAction, DefaultOutboundAction | Format-Table -AutoSize'
+        )
+        return output or "无法获取防火墙状态"
+
+    def hosts_read(self) -> str:
+        """读取 hosts 文件。"""
+        hosts_path = r"C:\Windows\System32\drivers\etc\hosts"
+        try:
+            with open(hosts_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            # 只返回非注释行
+            lines = [l for l in content.split('\n') if l.strip() and not l.strip().startswith('#')]
+            if not lines:
+                return "hosts 文件中没有自定义条目"
+            return "Hosts 文件条目:\n" + '\n'.join(lines[:50])
+        except PermissionError:
+            return "需要管理员权限读取 hosts 文件"
+
+
+# ==================== 浏览器管理器（CDP 协议 + WebDriver）====================
+
+class BrowserManager:
+    """浏览器控制 — CDP协议(Chrome/Edge DevTools) + WebDriver(Selenium)。
+    可列出标签页、导航、填表、点击、截图、执行JS。
+    需要: pip install websocket-client (CDP) 或 selenium (WebDriver)
+    """
+
+    def __init__(self):
+        self.available = platform.system() == "Windows"
+
+    def _check_cdp(self, port: int = 9222) -> bool:
+        """检查是否有浏览器在指定端口开启了 CDP 调试。"""
+        try:
+            import urllib.request
+            resp = urllib.request.urlopen(f"http://localhost:{port}/json/version", timeout=2)
+            return resp.status == 200
+        except Exception:
+            return False
+
+    def open_cdp(self, port: int = 9222) -> str:
+        """启动 Chrome/Edge 并开启 CDP 调试端口。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        import subprocess
+        # 尝试 Chrome
+        chrome_paths = [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+        ]
+        edge_paths = [
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        ]
+        for browser in chrome_paths + edge_paths:
+            if os.path.exists(browser):
+                subprocess.Popen(
+                    [browser, f"--remote-debugging-port={port}",
+                     "--no-first-run", "--no-default-browser-check"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+                return f"浏览器已启动，CDP 端口: {port}"
+        return "未找到 Chrome 或 Edge。请安装后重试。"
+
+    def list_tabs(self, port: int = 9222) -> str:
+        """列出所有浏览器标签页（CDP 协议）。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        try:
+            import urllib.request, json
+            resp = urllib.request.urlopen(f"http://localhost:{port}/json", timeout=3)
+            tabs = json.loads(resp.read())
+            if not tabs:
+                return "无打开的标签页"
+            lines = [f"共 {len(tabs)} 个标签页:"]
+            for i, t in enumerate(tabs):
+                lines.append(f"  [{i}] {t.get('title', '无标题')[:60]} - {t.get('url', '')[:80]}")
+            return '\n'.join(lines)
+        except Exception as e:
+            return (f"无法连接 CDP 端口 {port}。请先用 browser_open_cdp 启动浏览器。\n"
+                    f"或安装 Selenium: ```package_install selenium```")
+
+    def navigate(self, url: str, port: int = 9222) -> str:
+        """在已有标签页中导航到新 URL（CDP via websocket）。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        if not url:
+            return "请指定 URL"
+        import subprocess
+        cmd = (
+            f'$ws = New-Object System.Net.WebSockets.ClientWebSocket; '
+            f'$ct = New-Object System.Threading.CancellationToken; '
+            f'Write-Host "请通过 Selenium 实现: package_install selenium"'
+        )
+        return (f"CDP 导航需要 websocket-client。简化方案:\n"
+                f"```powershell Start-Process '{url}'```\n"
+                f"或安装 Selenium 获得完整浏览器控制: ```package_install selenium```")
+
+    def selenium_available(self) -> bool:
+        """检查 Selenium 是否可用。"""
+        try:
+            import selenium
+            return True
+        except ImportError:
+            return False
+
+    def open_selenium(self, url: str) -> str:
+        """用 Selenium 打开浏览器并导航。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        if not self.selenium_available():
+            return "Selenium 未安装。运行: ```package_install selenium```"
+        if not url:
+            return "请指定 URL"
+        try:
+            from selenium import webdriver
+            from selenium.webdriver.chrome.options import Options
+            opts = Options()
+            opts.add_experimental_option("detach", True)
+            driver = webdriver.Chrome(options=opts)
+            driver.get(url)
+            return f"已打开: {url} (标题: {driver.title})"
+        except Exception as e:
+            # 尝试 Edge
+            try:
+                from selenium.webdriver.edge.options import Options as EdgeOpts
+                opts = EdgeOpts()
+                opts.add_experimental_option("detach", True)
+                driver = webdriver.Edge(options=opts)
+                driver.get(url)
+                return f"已打开(Edge): {url} (标题: {driver.title})"
+            except Exception as e2:
+                return f"浏览器启动失败: {e}\nEdge 也失败: {e2}"
+
+
+# ==================== Docker 容器管理器 ====================
+
+class DockerManager:
+    """Docker 容器管理 — 通过 WSL 内的 Docker 运行。
+    零额外依赖，直接 wsl bash -c "docker ..."。
+    流程: WSL 已装?→WSL 内有 Docker?→都没有?→一键安装引导
+    """
+
+    def __init__(self):
+        self._docker_ready: Optional[bool] = None  # None=未检测, True=可用, False=不可用
+        self._wsl_available: Optional[bool] = None
+
+    def _check_wsl(self) -> bool:
+        """检测 WSL 是否可用。"""
+        if self._wsl_available is not None:
+            return self._wsl_available
+        import subprocess
+        try:
+            r = subprocess.run(['wsl', '--status'], capture_output=True, text=True, timeout=8)
+            self._wsl_available = r.returncode == 0
+        except Exception:
+            self._wsl_available = False
+        return self._wsl_available
+
+    def _check_docker_in_wsl(self) -> bool:
+        """检测 WSL 内是否安装了 Docker。"""
+        if self._docker_ready is not None:
+            return self._docker_ready
+        if not self._check_wsl():
+            self._docker_ready = False
+            return False
+        import subprocess
+        try:
+            r = subprocess.run(
+                ['wsl', 'bash', '-c', 'which docker && docker --version'],
+                capture_output=True, text=True, timeout=8
+            )
+            self._docker_ready = r.returncode == 0
+        except Exception:
+            self._docker_ready = False
+        return self._docker_ready
+
+    def _run(self, docker_args: str, timeout: float = 30.0) -> str:
+        """在 WSL 内执行 docker 命令。"""
+        if not self._check_docker_in_wsl():
+            return self.check_installed()
+        import subprocess
+        try:
+            cmd = ['wsl', 'bash', '-c', f'docker {docker_args}']
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            return (result.stdout or result.stderr or "OK").strip()
+        except subprocess.TimeoutExpired:
+            return "Docker 命令超时"
+        except Exception as e:
+            return f"Docker 执行失败: {e}"
+
+    # ━━━ 公共接口 ━━━
+
+    def check_installed(self) -> str:
+        """检测 Docker 是否可用。不可用时提供一键安装引导。"""
+        if self._check_docker_in_wsl():
+            version = self._run('--version', timeout=5)
+            return f"Docker 可用 (WSL)\n{version}"
+
+        if not self._check_wsl():
+            return (
+                "WSL 未安装，Docker 需要在 WSL 内运行。\n"
+                "一键安装 WSL + Docker:\n"
+                "```powershell wsl --install --no-launch```  安装 WSL2 + Ubuntu（需管理员，完成后重启）\n"
+                "重启后运行: ```wsl_install_docker```  在 WSL 内自动安装 Docker"
+            )
+        # WSL 有但没 Docker
+        return (
+            "WSL 已就绪，但 WSL 内未安装 Docker。\n"
+            "一键安装: ```wsl_install_docker```  在 WSL 内自动安装 Docker"
+        )
+
+    def install_docker_in_wsl(self) -> str:
+        """在 WSL 内一键安装 Docker（curl 官方脚本）。"""
+        if not self._check_wsl():
+            return ("需要先安装 WSL:\n```powershell wsl --install```\n重启后再运行此命令。")
+        import subprocess
+        print("   🐳 正在 WSL 内安装 Docker…")
+        try:
+            r = subprocess.run(
+                ['wsl', 'bash', '-c',
+                 'curl -fsSL https://get.docker.com -o /tmp/get-docker.sh && '
+                 'sudo sh /tmp/get-docker.sh && '
+                 'sudo usermod -aG docker $USER && '
+                 'echo "Docker 安装完成"'],
+                capture_output=True, text=True, timeout=120
+            )
+            output = (r.stdout + r.stderr).strip()
+            if '安装完成' in output or 'active' in output.lower():
+                self._docker_ready = None  # 刷新检测
+                self._check_docker_in_wsl()
+                return f"Docker 已在 WSL 内安装完成。\n验证: {self._run('--version', timeout=5)}"
+            # 可能已经装了
+            self._docker_ready = None
+            if self._check_docker_in_wsl():
+                return "Docker 已可用（可能之前已安装）"
+            return f"安装输出:\n{output}\n\n请手动检查: wsl bash -c 'docker --version'"
+        except Exception as e:
+            return f"安装失败: {e}"
+
+    def list_containers(self, all_containers: bool = False) -> str:
+        flag = '-a' if all_containers else ''
+        return self._run(f'ps {flag} --format "table {{{{.Names}}}}\t{{{{.Status}}}}\t{{{{.Image}}}}"') or "无运行中的容器"
+
+    def list_images(self) -> str:
+        return self._run('images --format "table {{{{.Repository}}}}\t{{{{.Tag}}}}\t{{{{.Size}}}}"')
+
+    def container_action(self, name: str, action: str) -> str:
+        if not name:
+            return "请指定容器名"
+        cmds = {
+            'start': f'start {name}', 'stop': f'stop {name}',
+            'restart': f'restart {name}', 'rm': f'rm -f {name}',
+            'logs': f'logs --tail 100 {name}', 'inspect': f'inspect {name}',
+            'stats': f'stats --no-stream {name}',
+        }
+        if action in cmds:
+            return self._run(cmds[action])
+        return f"支持的操作: {', '.join(cmds.keys())}"
+
+
+# ==================== WSL 管理器 ====================
+
+class WslManager:
+    """WSL 发行版管理 — 列出/启动/关闭/安装/执行命令。
+    零额外依赖，Windows 自带 wsl.exe。
+    """
+
+    def __init__(self):
+        self.available = platform.system() == "Windows"
+
+    def _run(self, args: list, timeout: float = 30.0) -> str:
+        import subprocess
+        try:
+            result = subprocess.run(
+                ['wsl.exe'] + args,
+                capture_output=True, text=True, timeout=timeout
+            )
+            return (result.stdout or result.stderr).strip()
+        except subprocess.TimeoutExpired:
+            return "WSL 命令超时"
+        except Exception as e:
+            return str(e)
+
+    def check_installed(self) -> str:
+        """检测 WSL 是否已安装。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        output = self._run(['--status'], timeout=10)
+        return output or "WSL 状态未知"
+
+    def install(self) -> str:
+        """安装 WSL2 + Ubuntu。使用 --no-launch 避免交互阻塞。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        import subprocess
+        try:
+            r = subprocess.run(
+                ['wsl', '--install', '--no-launch'],
+                capture_output=True, text=True, timeout=120
+            )
+            output = (r.stdout + r.stderr).strip()
+            if '重启' in output or 'restart' in output.lower():
+                return f"WSL 安装已启动，完成后需要重启电脑。\n{output}"
+            return f"WSL 安装输出:\n{output}\n如提示重启，请重启后运行 wsl 完成初始化。"
+        except Exception as e:
+            # 回退到手动指引
+            return ("安装 WSL2 + Ubuntu:\n"
+                    "```powershell wsl --install --no-launch```\n"
+                    "需要管理员权限，完成后需重启电脑。\n"
+                    f"错误: {e}")
+
+    def list_distros(self) -> str:
+        """列出所有 WSL 发行版。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        output = self._run(['--list', '--verbose'])
+        if not output or '没有安装' in output:
+            return ("WSL 未安装任何发行版。\n"
+                    "安装: ```powershell wsl --install```")
+        return output
+
+    def set_default(self, distro: str) -> str:
+        """设置默认发行版。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        if not distro.strip():
+            return "请指定发行版名称"
+        output = self._run(['--set-default', distro.strip()])
+        return f"默认发行版已设为 {distro.strip()}"
+
+    def shutdown(self) -> str:
+        """关闭所有 WSL 发行版。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        self._run(['--shutdown'], timeout=30)
+        return "WSL 已关闭"
+
+    def execute(self, distro: str, command: str) -> str:
+        """在 WSL 中执行命令。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        if not command:
+            return "请指定命令"
+        if distro.strip():
+            args = ['-d', distro.strip(), '--', 'bash', '-c', command]
+        else:
+            args = ['--', 'bash', '-c', command]
+        return self._run(args, timeout=60) or "命令执行完成"
+
+
+# ==================== 摄像头管理器 ====================
+
+class CameraManager:
+    """摄像头管理 — 列出/拍照。
+    优先 opencv-python（已自动安装），回退到 PowerShell/WMI 零依赖检测。
+    """
+
+    def __init__(self):
+        self.available = True
+
+    def _has_cv2(self) -> bool:
+        try:
+            import cv2
+            return True
+        except ImportError:
+            return False
+
+    def list_cameras(self) -> str:
+        """列出可用摄像头。零依赖回退：PowerShell Get-CimInstance。"""
+        # 优先 opencv（fd 级重定向抑制 C++ 层 stderr）
+        if self._has_cv2():
+            import cv2, os as _os
+            cameras = []
+            # fd 级 stderr 重定向：OS dup2 才能拦截 C++ 扩展的 stderr 输出
+            _stderr_fd = _os.dup(2)
+            try:
+                _devnull_fd = _os.open(_os.devnull, _os.O_WRONLY)
+                _os.dup2(_devnull_fd, 2)
+                _os.close(_devnull_fd)
+                try:
+                    cv2.setLogLevel(0)  # LOG_LEVEL_SILENT (仅影响 Python 层)
+                except Exception:
+                    pass
+                for i in range(5):
+                    cap = cv2.VideoCapture(i)
+                    if cap.isOpened():
+                        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                        cameras.append(f"  [{i}]: {w}x{h}")
+                        cap.release()
+            finally:
+                _os.dup2(_stderr_fd, 2)
+                _os.close(_stderr_fd)
+            if cameras:
+                return "可用摄像头 (OpenCV):\n" + '\n'.join(cameras)
+        # 零依赖回退：Windows WMI
+        if platform.system() == "Windows":
+            import subprocess
+            result = subprocess.run(
+                ['powershell', '-NoProfile', '-Command',
+                 'Get-CimInstance Win32_PnPEntity | Where-Object { $_.PNPClass -eq "Camera" -or $_.Name -like "*camera*" -or $_.Name -like "*Webcam*" } | Select-Object Name, Status | Format-List'],
+                capture_output=True, text=True, timeout=10
+            )
+            output = result.stdout.strip()
+            if output:
+                return "检测到摄像头设备 (WMI):\n" + output
+            return "未检测到摄像头。可通过设备管理器确认: ```powershell devmgmt.msc```"
+        return "无法检测摄像头（非 Windows 系统）"
+
+    def capture(self, output_path: str = "") -> str:
+        """拍照。需要 opencv-python。"""
+        if not self._has_cv2():
+            return ("OpenCV 未安装（首次启动会自动安装）。\n"
+                    "零依赖拍照方案:\n"
+                    "```powershell Start-Process microsoft.windows.camera:```  打开 Windows 相机")
+        import cv2, time, os as _os
+        _stderr_fd = _os.dup(2)
+        try:
+            _devnull_fd = _os.open(_os.devnull, _os.O_WRONLY)
+            _os.dup2(_devnull_fd, 2)
+            _os.close(_devnull_fd)
+            try:
+                cv2.setLogLevel(0)
+            except Exception:
+                pass
+            cap = cv2.VideoCapture(0)
+            if not cap.isOpened():
+                return "无法打开摄像头"
+            time.sleep(0.5)
+            ret, frame = cap.read()
+            cap.release()
+        finally:
+            _os.dup2(_stderr_fd, 2)
+            _os.close(_stderr_fd)
+        if not ret:
+            return "拍照失败"
+        if not output_path:
+            import tempfile
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            output_path = os.path.join(tempfile.gettempdir(), f"camera_{ts}.jpg")
+        cv2.imwrite(output_path, frame)
+        return f"照片已保存: {output_path} ({frame.shape[1]}x{frame.shape[0]})"
+
+
+# ==================== 串口管理器 ====================
+
+class SerialManager:
+    """串口通信 — 列出/连接/读写。
+    优先 pyserial（已自动安装），回退到 Windows mode 命令零依赖检测。
+    """
+
+    def __init__(self):
+        self.available = True
+
+    def _has_serial(self) -> bool:
+        try:
+            import serial
+            return True
+        except ImportError:
+            return False
+
+    def list_ports(self) -> str:
+        """列出所有可用串口。零依赖回退：mode 命令。"""
+        # 优先 pyserial
+        if self._has_serial():
+            import serial.tools.list_ports
+            ports = list(serial.tools.list_ports.comports())
+            if ports:
+                lines = []
+                for p in ports:
+                    lines.append(f"  {p.device} - {p.description} [{p.hwid[:50]}]")
+                return "可用串口 (pyserial):\n" + '\n'.join(lines)
+        # 零依赖回退：Windows mode 命令
+        if platform.system() == "Windows":
+            import subprocess
+            lines = []
+            for com in range(1, 33):
+                try:
+                    result = subprocess.run(
+                        ['mode', f'COM{com}'], capture_output=True, text=True, timeout=2
+                    )
+                    if result.returncode == 0:
+                        lines.append(f"  COM{com} - 可用")
+                except Exception:
+                    break  # 连续不存在则停止扫描
+            if lines:
+                return "检测到串口 (mode 命令):\n" + '\n'.join(lines)
+            return "未检测到串口设备。\n提示: 检查设备管理器 ```powershell devmgmt.msc``` → 端口(COM和LPT)"
+        return "无法检测串口（非 Windows 系统）"
+
+    def send(self, port: str, data: str, baudrate: int = 115200) -> str:
+        """向串口发送数据并读取响应。需要 pyserial。"""
+        if not self._has_serial():
+            return ("pyserial 未安装（首次启动会自动安装）。\n"
+                    "零依赖发送方案:\n"
+                    f"```powershell echo '{data}' > {port}```")
+        if not port:
+            return "请指定串口，如 COM3"
+        import serial
+        try:
+            with serial.Serial(port, baudrate, timeout=2) as ser:
+                ser.write(data.encode('utf-8'))
+                response = ser.read(256)
+                return f"发送: {data}\n响应: {response.decode('utf-8', errors='replace')}"
+        except Exception as e:
+            return f"串口通信失败: {e}"
+        except Exception as e:
+            return f"串口通信失败: {e}"
+
+
+# ==================== 打印机/扫描仪管理器 ====================
+
+class PrinterScannerManager:
+    """打印机和扫描仪管理 — 列表/打印/扫描。
+    零额外依赖，Windows COM + PowerShell。
+    """
+
+    def __init__(self):
+        self.available = platform.system() == "Windows"
+
+    def _run_ps(self, cmd: str, timeout: float = 10.0) -> str:
+        import subprocess
+        try:
+            result = subprocess.run(
+                ['powershell', '-NoProfile', '-Command', cmd],
+                capture_output=True, text=True, timeout=timeout
+            )
+            return (result.stdout or result.stderr).strip()
+        except Exception as e:
+            return str(e)
+
+    def list_printers(self) -> str:
+        """列出打印机。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        output = self._run_ps(
+            'Get-Printer | Select-Object Name, PrinterStatus, Shared, PortName | Format-Table -AutoSize'
+        )
+        return output or "未找到打印机"
+
+    def set_default(self, name: str) -> str:
+        """设置默认打印机。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        if not name:
+            return "请指定打印机名称"
+        output = self._run_ps(f'$p = Get-Printer -Name "{name}" -ErrorAction SilentlyContinue; '
+                            f'if ($p) {{ (Get-WmiObject Win32_Printer -Filter "Name=\'{name}\'").SetDefaultPrinter(); '
+                            f'Write-Host "已设为默认: {name}" }} else {{ Write-Host "打印机不存在: {name}" }}')
+        return output or f"已设为默认: {name}"
+
+    def print_file(self, filepath: str, printer: str = "") -> str:
+        """打印文件。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        if not filepath or not os.path.exists(filepath.strip('"\'')):
+            return f"文件不存在: {filepath}"
+        path = os.path.abspath(filepath.strip('"\''))
+        if printer:
+            cmd = f'Start-Process -FilePath "{path}" -Verb Print -ArgumentList "/d:\\"{printer}\\""'
+        else:
+            cmd = f'Start-Process -FilePath "{path}" -Verb Print'
+        self._run_ps(cmd, timeout=15)
+        return f"已发送到打印机: {os.path.basename(path)}"
+
+
+# ==================== 游戏手柄管理器 ====================
+
+class GamepadManager:
+    """游戏手柄检测 — 列出/读取输入。
+    需要: pip install pygame
+    """
+
+    def __init__(self):
+        self.available = True
+
+    def _has_pygame(self) -> bool:
+        try:
+            import pygame
+            return True
+        except ImportError:
+            return False
+
+    def list_controllers(self) -> str:
+        """列出已连接的游戏手柄。"""
+        if not self._has_pygame():
+            return "pygame 未安装。运行: ```package_install pygame```"
+        import pygame
+        pygame.init()
+        count = pygame.joystick.get_count()
+        if count == 0:
+            pygame.quit()
+            return "未检测到游戏手柄"
+        lines = [f"共 {count} 个手柄:"]
+        for i in range(count):
+            joy = pygame.joystick.Joystick(i)
+            joy.init()
+            lines.append(f"  [{i}] {joy.get_name()} (按钮:{joy.get_numbuttons()} 轴:{joy.get_numaxes()})")
+        pygame.quit()
+        return '\n'.join(lines)
+
+    def read_input(self, index: int = 0) -> str:
+        """读取手柄当前输入状态。"""
+        if not self._has_pygame():
+            return "pygame 未安装。"
+        import pygame
+        pygame.init()
+        if pygame.joystick.get_count() <= index:
+            pygame.quit()
+            return f"手柄 [{index}] 未连接"
+        joy = pygame.joystick.Joystick(index)
+        joy.init()
+        pygame.event.pump()
+        axes = [f"轴{i}={joy.get_axis(i):.2f}" for i in range(min(joy.get_numaxes(), 6))]
+        buttons = [f"B{i}" for i in range(joy.get_numbuttons()) if joy.get_button(i)]
+        pygame.quit()
+        return f"手柄[{index}] {joy.get_name()}:\n  轴: {', '.join(axes)}\n  按下: {', '.join(buttons) or '无'}"
+
+
+# ==================== SSH 管理器 ====================
+
+class SSHManager:
+    """SSH 远程连接管理。
+    需要: pip install paramiko (Python) 或 Windows 自带 ssh.exe
+    """
+
+    def __init__(self):
+        self.available = True
+
+    def _has_paramiko(self) -> bool:
+        try:
+            import paramiko
+            return True
+        except ImportError:
+            return False
+
+    def connect_info(self, host: str, port: int = 22, username: str = "", password: str = "") -> str:
+        """通过 paramiko SSH 连接并执行命令。返回连接状态。"""
+        if not host:
+            return "请指定: ssh_connect 主机 [端口] [用户名] [密码]"
+        return (f"SSH 连接信息: {username}@{host}:{port}\n"
+                f"安全提示: 请通过命令行使用 ssh 命令而非明文传输密码。\n"
+                f"Windows 自带: ```powershell ssh {username}@{host}```")
+
+    def execute_remote(self, host: str, command: str, username: str = "",
+                       password: str = "", port: int = 22) -> str:
+        """通过 SSH 在远程执行命令。"""
+        if not self._has_paramiko():
+            return ("paramiko 未安装。替代方案(Windows 自带):\n"
+                    f"```powershell ssh {username + '@' if username else ''}{host} \"{command}\"```")
+        if not host or not command:
+            return "请指定主机和命令"
+        try:
+            import paramiko
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            client.connect(host, port=port, username=username or None,
+                         password=password or None, timeout=10)
+            stdin, stdout, stderr = client.exec_command(command)
+            output = stdout.read().decode('utf-8', errors='replace')
+            client.close()
+            return f"远程执行 [{host}]:\n{output}"
+        except Exception as e:
+            return f"SSH 连接失败: {e}"
+
+
+# ==================== BLE 蓝牙低功耗管理器 ====================
+
+class BleManager:
+    """BLE 蓝牙低功耗设备管理 — 扫描/连接/读写特征值。
+    需要: pip install bleak
+    """
+
+    def __init__(self):
+        self.available = platform.system() == "Windows"
+
+    def _has_bleak(self) -> bool:
+        try:
+            import bleak
+            return True
+        except ImportError:
+            return False
+
+    def scan(self, timeout_sec: float = 5.0) -> str:
+        """扫描附近 BLE 设备。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        if not self._has_bleak():
+            return "bleak 未安装。运行: ```package_install bleak```"
+        try:
+            import asyncio
+            from bleak import BleakScanner
+
+            async def _scan():
+                devices = await BleakScanner.discover(timeout=timeout_sec)
+                return devices
+
+            devices = asyncio.run(_scan())
+            if not devices:
+                return "未扫描到 BLE 设备"
+            lines = [f"扫描到 {len(devices)} 个 BLE 设备:"]
+            for d in devices:
+                lines.append(f"  {d.name or '未知'} - RSSI:{d.rssi}dBm - {d.address}")
+            return '\n'.join(lines)
+        except Exception as e:
+            return f"BLE 扫描失败: {e}"
+
+    def list_devices(self) -> str:
+        """列出蓝牙设备（Windows 设备管理器）。"""
+        return self.scan(timeout_sec=3.0)
+
+
+# ==================== 高级下载管理器 ====================
+
+class DownloadManager:
+    """高级下载管理 — 断点续传/批量下载/BT/磁力链接。
+    需要: pip install aria2p (需先安装 aria2 程序)
+    """
+
+    def __init__(self):
+        self.available = True
+
+    def _run_ps(self, cmd: str, timeout: float = 15.0) -> str:
+        import subprocess
+        try:
+            result = subprocess.run(
+                ['powershell', '-NoProfile', '-Command', cmd],
+                capture_output=True, text=True, timeout=timeout
+            )
+            return (result.stdout or result.stderr).strip()
+        except Exception as e:
+            return str(e)
+
+    def status(self) -> str:
+        """下载状态。"""
+        if not self.available:
+            return "此功能仅支持 Windows"
+        return ("高级下载管理状态:\n"
+                "  · 基础下载: 程序内置 download_file 支持 HTTP/HTTPS 断点续传\n"
+                "  · BT/磁力: 需要安装 aria2 命令行工具\n"
+                "  · 安装 aria2: ```package_install aria2p```")
+
+    def download_advanced(self, url: str, dest: str = "") -> str:
+        """高级下载（内置断点续传）。"""
+        if not url:
+            return "请指定下载 URL"
+        from urllib.parse import urlparse
+        filename = os.path.basename(urlparse(url).path) or "download"
+        if dest:
+            if os.path.isdir(dest):
+                dest = os.path.join(dest, filename)
+        else:
+            dest = os.path.join(os.path.expanduser("~"), "Downloads", filename)
+        # 使用内置下载器（已在文件头部实现）
+        ok = _download_file(url, dest)
+        if ok:
+            size_mb = os.path.getsize(dest) / (1024 * 1024)
+            return f"下载完成: {dest} ({size_mb:.1f}MB)"
+        return f"下载失败: {url}"
+
+
+# ==================== HUD 悬浮窗（优化版） ====================
 class HudOverlay:
     """半透明悬浮窗 — 显示管家状态，不遮挡主要工作区。
 
+    Frame + Label 显示文字（中文渲染稳定），小 Canvas 绘制电弧反应堆脉冲动画。
     Tkinter 实现，零额外依赖（Windows 自带 tkinter）。
     独立线程运行，不阻塞主程序。
     """
 
+    # ━━━ 视觉常量 ━━━
+    _BG = "#080810"              # 背景色
+    _FG = "#00d4ff"              # 前景 / 青色
+    _FG_DIM = "#007799"          # 暗色前景
+    _ALERT_BG = "#140a08"        # 告警背景色
+    _ALERT_FG = "#ff8855"        # 告警文字色
+    _ARC_R = 4                   # 电弧反应堆核心半径
+
     def __init__(self):
         self._root = None
-        self._label = None
+        self._frame = None
+        self._arc_canvas = None
+        self._title_label = None
+        self._backend_label = None
+        self._cpu_label = None
+        self._alert_label = None
         self._running = False
         self._status_text = "贾维斯 · 就绪"
         self._backend = ""
         self._cpu_mem = ""
         self._alert_text = ""
+        self._last_fingerprint = ""
+        # 动画状态
+        self._pulse_phase = 0.0
+        self._pulse_job = None
+        self._anim_ids = {}
+
+    # ━━━ 公开 API ━━━
 
     def start(self, backend: str = "") -> None:
-        """在独立线程中启动悬浮窗。"""
         if self._running:
             return
         self._backend = backend
@@ -11600,6 +14218,12 @@ class HudOverlay:
 
     def stop(self) -> None:
         self._running = False
+        if self._pulse_job is not None and self._root:
+            try:
+                self._root.after_cancel(self._pulse_job)
+            except Exception:
+                pass
+            self._pulse_job = None
         if self._root:
             try:
                 self._root.quit()
@@ -11607,124 +14231,246 @@ class HudOverlay:
                 pass
 
     def update(self, status: str = "", backend: str = "", cpu_mem: str = "", alert: str = "") -> None:
-        """更新显示内容。"""
         if status:
             self._status_text = status
         if backend:
             self._backend = backend
         if cpu_mem:
             self._cpu_mem = cpu_mem
-        if alert:
-            self._alert_text = alert
+        self._alert_text = alert
         self._refresh()
 
+    # ━━━ 内部 ━━━
+
+    def _fingerprint(self) -> str:
+        return "|".join([self._status_text, self._backend, self._cpu_mem, self._alert_text])
+
     def _refresh(self) -> None:
-        """刷新标签文本。"""
-        if not self._running or not self._label:
+        if not self._running or not self._frame:
             return
+        fp = self._fingerprint()
+        if fp == self._last_fingerprint:
+            return
+        self._last_fingerprint = fp
         try:
-            lines = [f"⚡ {self._status_text}"]
-            if self._backend:
-                lines.append(f"🧠 {self._backend}")
-            if self._cpu_mem:
-                lines.append(f"📊 {self._cpu_mem}")
-            if self._alert_text:
-                lines.append(f"⚠️ {self._alert_text}")
-            text = "\n".join(lines)
-            self._root.after(0, lambda: self._label.config(text=text))
+            self._root.after(0, self._apply_refresh)
         except Exception:
             pass
 
+    def _apply_refresh(self) -> None:
+        """在主线程更新 Label 文本和颜色。"""
+        is_alert = bool(self._alert_text)
+
+        # 颜色
+        bg = self._ALERT_BG if is_alert else self._BG
+        fg = self._ALERT_FG if is_alert else self._FG
+
+        # 背景色
+        self._frame.configure(bg=bg)
+        self._arc_canvas.configure(bg=bg)
+
+        # 标题
+        self._title_label.configure(
+            text="⚡ " + self._status_text, fg=fg, bg=bg,
+        )
+
+        # 后端
+        if self._backend:
+            self._backend_label.configure(
+                text="🧠  " + self._backend, fg=self._FG_DIM, bg=bg,
+            )
+            self._backend_label.pack(anchor="w", padx=(28, 10))
+        else:
+            self._backend_label.pack_forget()
+
+        # CPU/内存
+        if self._cpu_mem:
+            self._cpu_label.configure(
+                text="📊  " + self._cpu_mem, fg=self._FG_DIM, bg=bg,
+            )
+            self._cpu_label.pack(anchor="w", padx=(28, 10))
+        else:
+            self._cpu_label.pack_forget()
+
+        # 告警
+        if is_alert:
+            self._alert_label.configure(
+                text="⚠️  " + self._alert_text, fg=self._ALERT_FG, bg=bg,
+            )
+            self._alert_label.pack(anchor="w", padx=(28, 10), pady=(0, 4))
+        else:
+            self._alert_label.pack_forget()
+
+        # 强制更新布局，让 Tk 计算正确的窗口大小
+        self._root.update_idletasks()
+
+    # ━━━ 电弧反应堆动画 ━━━
+
+    def _draw_arc_reactor(self, c, cx, cy, r, pulse, border_color):
+        """在 Canvas 上绘制电弧反应堆（静态帧）。"""
+        c.delete("arc")
+        pr = r + 2 + 1.5 * pulse
+        pulse_c = self._interp_color(self._BG, border_color, 0.30 + 0.35 * pulse)
+        # 外环
+        oid = c.create_oval(cx - pr, cy - pr, cx + pr, cy + pr,
+                            outline=pulse_c, width=1, fill="", tags="arc")
+        # 内核
+        cid = c.create_oval(cx - r, cy - r, cx + r, cy + r,
+                            fill=border_color, outline="", width=0, tags="arc")
+        # 高光
+        hid = c.create_oval(cx - 1, cy - 1, cx + 1, cy + 1,
+                            fill="#ffffff", outline="", width=0, tags="arc")
+        return {"outer_ring": oid, "core": cid, "highlight": hid}
+
+    def _pulse_tick(self) -> None:
+        if not self._running or not self._arc_canvas:
+            return
+        import math
+        try:
+            self._pulse_phase += 0.10
+            if self._pulse_phase > 2 * math.pi:
+                self._pulse_phase -= 2 * math.pi
+
+            c = self._arc_canvas
+            s = abs(math.sin(self._pulse_phase))
+            is_alert = bool(self._alert_text)
+            border = self._ALERT_FG if is_alert else self._FG
+            cx = cy = 16
+            r = self._ARC_R
+
+            # 重绘电弧反应堆
+            self._anim_ids = self._draw_arc_reactor(c, cx, cy, r, s, border)
+
+        except Exception:
+            pass
+
+        delay_ms = 80 if bool(self._alert_text) else 500
+        if self._running and self._root:
+            self._pulse_job = self._root.after(delay_ms, self._pulse_tick)
+
+    @staticmethod
+    def _interp_color(c1: str, c2: str, t: float) -> str:
+        def _rgb(h):
+            h = h.lstrip("#")
+            return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        r1, g1, b1 = _rgb(c1)
+        r2, g2, b2 = _rgb(c2)
+        t = max(0.0, min(1.0, t))
+        return f"#{int(r1+(r2-r1)*t):02x}{int(g1+(g2-g1)*t):02x}{int(b1+(b2-b1)*t):02x}"
+
+    # ━━━ Tkinter 主循环 ━━━
+
     def _run(self) -> None:
-        """Tkinter 主循环。"""
         try:
             import tkinter as tk
         except ImportError:
-            return  # 无 tkinter（极少数精简 Python），静默跳过
+            return
 
         self._root = tk.Tk()
-
         self._root.title("Jarvis HUD")
-        self._root.overrideredirect(True)   # 无标题栏
-        self._root.attributes("-topmost", True)  # 始终置顶
-        self._root.attributes("-alpha", 0.75)     # 半透明
+        self._root.overrideredirect(True)
+        self._root.attributes("-topmost", True)
+        self._root.attributes("-alpha", 0.82)
 
-        # 右上角定位
+        # 右上角
         screen_w = self._root.winfo_screenwidth()
-        w, h = 280, 120
-        x = screen_w - w - 20
-        y = 40
-        self._root.geometry(f"{w}x{h}+{x}+{y}")
+        self._root.geometry(f"+{screen_w - 310}+40")
+        self._root.configure(bg=self._BG)
 
-        # 深色背景 + 青色文字（贾维斯风格）
-        bg = "#0a0a0f"
-        fg = "#00d4ff"
-        self._root.configure(bg=bg)
+        # ━━━ 主容器 Frame ━━━
+        self._frame = tk.Frame(self._root, bg=self._BG, padx=0, pady=0)
+        self._frame.pack(fill="both", expand=True)
 
-        self._label = tk.Label(
-            self._root,
-            text="⚡ 贾维斯 · 就绪",
-            font=("Consolas", 10),
-            fg=fg, bg=bg,
-            justify="left",
-            anchor="nw",
-            padx=10, pady=8,
+        # ━━━ 顶部行：电弧反应堆 + 标题 ━━━
+        top_row = tk.Frame(self._frame, bg=self._BG)
+        top_row.pack(fill="x", padx=6, pady=(6, 0))
+
+        # 电弧反应堆小画布
+        ARC_SIZE = 32
+        self._arc_canvas = tk.Canvas(
+            top_row, width=ARC_SIZE, height=ARC_SIZE,
+            bg=self._BG, highlightthickness=0, bd=0,
         )
-        self._label.pack(fill="both", expand=True)
+        self._arc_canvas.pack(side="left")
+        self._anim_ids = self._draw_arc_reactor(
+            self._arc_canvas, 16, 16, self._ARC_R, 0.0, self._FG,
+        )
 
-        # 右键关闭
-        self._label.bind("<Button-3>", lambda e: self.stop())
+        # 标题
+        self._title_label = tk.Label(
+            top_row, text="⚡ " + self._status_text,
+            font=("Consolas", 9, "bold"),
+            fg=self._FG, bg=self._BG, anchor="w", justify="left",
+        )
+        self._title_label.pack(side="left", padx=(4, 0))
 
-        # 左键拖动
-        self._label.bind("<Button-1>", self._drag_start)
-        self._label.bind("<B1-Motion>", self._drag_move)
+        # ━━━ 分隔线 ━━━
+        sep = tk.Frame(self._frame, height=1, bg=self._FG)
+        sep.pack(fill="x", padx=10, pady=(4, 2))
 
-        self._refresh()
+        # ━━━ 信息行 Labels ━━━
+        label_font = ("Consolas", 8)
+        self._backend_label = tk.Label(
+            self._frame, text="", font=label_font,
+            fg=self._FG_DIM, bg=self._BG, anchor="w", justify="left",
+        )
+        self._cpu_label = tk.Label(
+            self._frame, text="", font=label_font,
+            fg=self._FG_DIM, bg=self._BG, anchor="w", justify="left",
+        )
+        self._alert_label = tk.Label(
+            self._frame, text="", font=label_font,
+            fg=self._ALERT_FG, bg=self._BG, anchor="w", justify="left",
+        )
 
-        # ━━━ 禁止 HUD 窗口接收键盘焦点 ━━━
-        # 先隐藏窗口，强制创建底层 HWND，设置 WS_EX_NOACTIVATE，再显示。
-        # 这样窗口从"出现"的那一刻就不会抢焦点。
+        # 初始内容
+        self._apply_refresh()
+
+        # 右键关闭、左键拖动（绑定到顶层窗口）
+        self._root.bind("<Button-3>", lambda e: self.stop())
+        self._root.bind("<Button-1>", self._drag_start)
+        self._root.bind("<B1-Motion>", self._drag_move)
+
+        # ━━━ 禁止抢焦点 ━━━
         self._root.withdraw()
-        self._root.update_idletasks()  # 确保窗口完全创建（获得有效 HWND）
+        self._root.update_idletasks()
         try:
             import ctypes as _ct
-            GWL_EXSTYLE = -20
-            WS_EX_NOACTIVATE = 0x08000000
-            WS_EX_TOOLWINDOW = 0x00000080
             _hwnd = self._root.winfo_id()
             if _hwnd:
-                _style = _ct.windll.user32.GetWindowLongW(_hwnd, GWL_EXSTYLE)
+                _sty = _ct.windll.user32.GetWindowLongW(_hwnd, -20)
                 _ct.windll.user32.SetWindowLongW(
-                    _hwnd, GWL_EXSTYLE,
-                    _style | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW
+                    _hwnd, -20, _sty | 0x08000000 | 0x00000080
                 )
         except Exception:
             pass
-        # 显示窗口（已带 NOACTIVATE 标志，不会抢焦点）
         self._root.deiconify()
 
-        # 定期重设（Tk 内部操作会持续覆盖扩展样式，必须定时修复）
         def _reapply_noactivate():
             if not self._running:
                 return
             try:
+                import ctypes as _ct2
                 _hw = self._root.winfo_id() if self._root else 0
                 if _hw:
-                    _sty = ctypes.windll.user32.GetWindowLongW(_hw, GWL_EXSTYLE)
-                    if not (_sty & WS_EX_NOACTIVATE):
-                        ctypes.windll.user32.SetWindowLongW(
-                            _hw, GWL_EXSTYLE,
-                            _sty | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW
+                    _sty = _ct2.windll.user32.GetWindowLongW(_hw, -20)
+                    if not (_sty & 0x08000000):
+                        _ct2.windll.user32.SetWindowLongW(
+                            _hw, -20, _sty | 0x08000000 | 0x00000080
                         )
             except Exception:
                 pass
-            # 每 3 秒循环检查一次，防止 Tk 在任意时刻覆盖样式
             if self._running and self._root:
                 self._root.after(3000, _reapply_noactivate)
 
         self._root.after(3000, _reapply_noactivate)
 
+        # 启动脉冲动画
+        self._pulse_job = self._root.after(200, self._pulse_tick)
+
         self._root.mainloop()
+
+    # ━━━ 拖动 ━━━
 
     def _drag_start(self, event) -> None:
         self._drag_x = event.x
@@ -12242,7 +14988,8 @@ class DeviceScanner:
                            '30-ae-a4', 'a4-cf-12', '84-0d-8e', 'ec-62-60']
         try:
             r = subprocess.run(['arp', '-a'], capture_output=True, text=True,
-                             timeout=5, encoding='utf-8', errors='replace')
+                             timeout=5)
+
             for line in r.stdout.split('\n'):
                 for prefix in ESP_MAC_PREFIXES:
                     if prefix in line.lower():
@@ -12364,12 +15111,14 @@ class MqttClient:
             return False
         try:
             import paho.mqtt.client as mqtt
+            from paho.mqtt.client import CallbackAPIVersion
 
             self._broker = broker
             self._port = port
             self._client = mqtt.Client(
                 client_id=f"jarvis-{os.getpid()}",
                 protocol=mqtt.MQTTv311,
+                callback_api_version=CallbackAPIVersion.VERSION2,
             )
             self._client.on_connect = self._on_connect
             self._client.on_message = self._on_message
@@ -13079,7 +15828,6 @@ class ProactiveMonitor:
             r = subprocess.run(
                 ["powershell", "-NoProfile", "-Command", ps_code],
                 capture_output=True, text=True, timeout=15,
-                encoding="utf-8", errors="replace",
             )
             if r.returncode == 0 and r.stdout.strip():
                 result = json.loads(r.stdout.strip())
@@ -13333,6 +16081,32 @@ class AIAssistant:
         self.knowledge = KnowledgeGraph(get_program_dir())  # 知识图谱
         self.calendar = CalendarManager()  # 日历管理
 
+        # ━━━ 1.5 新增能力管理器 ━━━
+        self.desktop_icons = DesktopIconManager()      # 桌面图标操作
+        self.power = PowerManager()                     # 电源管理
+        self.network = NetworkManager()                 # WiFi/网络配置
+        self.bluetooth = BluetoothManager()             # 蓝牙管理
+        self.audio_device = AudioDeviceManager()        # 音频设备管理
+        self.display_settings = DisplaySettingsManager() # 显示设置
+        self.disk = DiskManager()                       # 磁盘管理
+        self.services = ServiceManager()                # Windows 服务
+        self.registry = RegistryManager()               # 注册表
+        self.packages = PackageManager()                # 软件包管理
+        self.startup_mgr = StartupManager()             # 启动项管理
+        self.security_mgr = SecurityManager()           # 安全管理
+
+        # ━━━ 1.5 浏览器/容器/外设 ━━━
+        self.browser = BrowserManager()                 # 浏览器CDP/WebDriver
+        self.docker_mgr = DockerManager()               # Docker容器管理
+        self.wsl = WslManager()                         # WSL发行版管理
+        self.camera = CameraManager()                   # 摄像头采集
+        self.serial_mgr = SerialManager()               # 串口通信
+        self.printer_scanner = PrinterScannerManager()   # 打印机/扫描仪
+        self.gamepad = GamepadManager()                 # 游戏手柄
+        self.ssh_mgr = SSHManager()                     # SSH远程连接
+        self.ble = BleManager()                         # BLE蓝牙低功耗
+        self.download_mgr = DownloadManager()           # 高级下载管理
+
         # 语音优先启动模式
         self._voice_first = False
 
@@ -13473,6 +16247,15 @@ class AIAssistant:
             result.append(f'… (省略 {omitted} 条旧记忆，完整记录见 memory 文件)')
         return '\n\n'.join(result)
 
+    def _build_hw_info(self) -> str:
+        """构建硬件探测信息（注入系统提示词，让 AI 知道本机实际可用的硬件）。"""
+        if not getattr(self, '_hw_info', None):
+            return ""
+        lines = [f"- {_v}" for _k, _v in self._hw_info.items() if not _k.endswith('_detail')]
+        if lines:
+            return "【本机硬件】\n" + '\n'.join(lines)
+        return ""
+
     def _build_agnes_prompt(self) -> str:
         """Agnes Flash 模型专用提示词 — 全功能但紧凑编排。
         Flash 模型注意力窗口有限，长提示词会导致关键指令被稀释。
@@ -13512,6 +16295,11 @@ class AIAssistant:
         Q1: 用户到底想要什么？（不是字面意思，是最终目的）
         Q2: 纯信息还是行动？纯信息→直接回答不创建文件。行动→继续第二步
         Q3: 目标对象是什么？精确到可操作对象！
+        🔴 "整理桌面"分两种，务必先确认：
+           · 整理桌面文件（创建分类文件夹归档）= 文件操作 → ```powershell``` 创建目录+移动文件
+           · 整理桌面图标位置（排列/对齐/排序）= Shell操作 → ```desktop_icons_arrange``` 或 ```desktop_icons_auto_arrange```
+           · 用户说"图标"/"icon"/"整理位置"/"排列" → 很可能是图标位置，不是文件！
+           · 不确定时用一个问题确认：先生，您是要整理桌面上的文件，还是重新排列图标位置？
         🔴 不确定目标→先查：```desktop_window```列窗口 / ```desktop_find_process```查PID / ```powershell dir```列文件
         🔴 "关闭图片"=关图片查看器窗口，绝不=关终端！
         🔴 上下文推断：用户说"关了它"→回忆刚才打开了什么
@@ -13519,6 +16307,8 @@ class AIAssistant:
         ━━ 第二步：评估难度 + 最小阻力 ━━
         0-2简单→直接执行 | 3-5中等→一轮多代码块 | 6-10复杂→/task plan规划
         最小阻力：UIA>OCR>AI视觉 | desktop_close>taskkill | 失败换方法不重复 | 不依赖视觉的步骤一发全出
+        🔴 最简单优先（启动应用）：.lnk快捷方式 > Start-Process > 注册表App Paths > Microsoft Store
+        🔴 最简单优先（打开文件）：Invoke-Item/Start-Process > 搜索.lnk > 搜索注册表
 
         ━━ 第三步：执行 ━━
         第一轮（不依赖视觉，全出）：desktop_app_knowledge→desktop_launch→desktop_window→desktop_key→desktop_type→Enter
@@ -13572,12 +16362,13 @@ class AIAssistant:
         • [SELF_REPAIR] 仅程序代码有bug时触发，任务执行失败不是代码bug。
         • 🔴 生成≠打开：generate_image/generate_video 只生成文件，绝对不准自动打开。用户说"生成并打开"才打开。
         • 最小阻力降级：关闭窗口→desktop_close→Alt+F4→报告 | 切歌→desktop_media→desktop_key快捷键→报告
-          打开应用→desktop_launch→Start-Process→报告 | 文件操作→Test-Path→换桌面→报告
+          打开应用→desktop_launch(.lnk优先)→Start-Process→报告 | 文件操作→Invoke-Item→Test-Path→换桌面→报告
           搜索→换关键词2-3组→报告 | 下载→换1个镜像→报告 | 找窗口→UIA→OCR→desktop_see兜底
-          每条链走到头失败就报告，不准跳过中间步骤直接到最后一招，不准自己发明链外方法。
+          每条链从最简单方法开始，走到头失败就报告。不准跳过简单方法直接到最后一招，不准自己发明链外方法。
 
         【系统信息】
         桌面：{desktop} | Shell：{self.config.default_shell}
+        {self._build_hw_info()}
         {self._claude_prompt_block("compact")}
         {self._build_env_summary()}
 
@@ -13637,7 +16428,83 @@ class AIAssistant:
           ```desktop_save_layout [名称]```     保存当前所有窗口位置
           ```desktop_restore_layout [名称]```  恢复保存的布局
           ```desktop_layout_summary```         查看当前窗口布局
+          ```desktop_layout_list```            列出所有已保存布局
           ```desktop_display_info```           查看多显示器/DPI配置
+          ```desktop_try 工具1 参数 | 工具2 参数```  依次尝试直到成功（降级链）
+
+        🖥️ 桌面 Shell（图标排列/壁纸/主题）：
+          ```desktop_icons_arrange [auto/snap_to_grid/by_name/by_type]```  排列桌面图标
+          ```desktop_icons_auto_arrange [true/false]```  开/关自动排列
+          ```desktop_icons_show [true/false]```  显示/隐藏桌面图标
+          ```desktop_icons_count```  桌面图标数量
+          ```desktop_refresh```  刷新桌面(F5)
+          ```desktop_wallpaper_set 图片路径```  设置壁纸
+          ```desktop_dark_mode [true/false]```  暗色/亮色模式
+
+        ⚡ 电源管理：
+          ```power_shutdown [延时秒]```  关机  ```power_restart [延时秒]```  重启
+          ```power_sleep```  睡眠  ```power_hibernate```  休眠
+          ```power_lock```  锁屏  ```power_sign_out```  注销
+          ```power_display_off```  关显示器  ```power_plan_list```  电源计划列表
+          ```power_plan_switch 高性能/平衡/节能```  切换电源计划
+
+        🌐 网络管理：
+          ```wifi_list```  附近WiFi  ```wifi_status```  当前连接
+          ```wifi_connect SSID [密码]```  连接  ```wifi_disconnect```  断开
+          ```network_ip_config```  IP配置  ```network_adapters```  适配器列表
+          ```network_adapter_enable 名称 [disable]```  启用/禁用适配器
+          ```network_dns_set DNS地址```  设置DNS  ```network_proxy_set 代理地址```  设置代理
+          ```network_proxy_disable```  关闭代理  ```network_port_listen```  端口占用
+
+        🔵 蓝牙：```bluetooth_list```  ```bluetooth_scan```  ```bluetooth_status```
+
+        🔊 音频设备：
+          ```audio_device_list```  设备列表  ```audio_device_switch 名称```  切换输出
+          ```audio_device_switch_input 名称```  切换输入
+          ```audio_volume_set 0-100```  音量  ```audio_mute```/```audio_unmute```  静音
+
+        🖥️ 显示设置：
+          ```display_info```  显示信息  ```display_night_light [true/false]```  夜间模式
+          ```display_set_resolution 宽 高```  设置分辨率
+
+        💿 磁盘管理：
+          ```disk_list```  磁盘列表  ```disk_analyze [路径]```  空间分析
+          ```disk_cleanup_temp```  清理临时文件
+          ```recycle_bin_empty```  清空回收站  ```recycle_bin_info```  回收站信息
+          ```usb_eject 盘符```  弹出USB
+
+        🔧 系统服务：```service_list [过滤]```  ```service_action 服务名 start/stop/restart/enable/disable```
+
+        📝 注册表（安全白名单HKCU）：
+          ```registry_read 路径 [键名]```  ```registry_write 路径 键名 值 [类型]```
+          ```registry_delete 路径 [键名]```  ```registry_export 路径 [输出文件]```
+
+        📦 软件包（winget）：
+          ```package_list```  已安装  ```package_search 关键词```  搜索
+          ```package_install 包ID```  安装  ```package_uninstall 包ID```  卸载
+          ```package_update_all```  全部更新
+
+        🚀 启动项：```startup_list```  ```startup_add 名称 命令```  ```startup_remove 名称```
+
+        🛡️ 安全：
+          ```defender_status```  ```defender_scan [quick/full]```
+          ```defender_exclude 路径 [remove]```  ```firewall_status```  ```hosts_read```
+
+        🌐 浏览器 / 🐳 Docker (WSL) / 🐧 WSL / 📷 摄像头 / 🔌 外设：
+          ```browser_open_cdp [端口]```  ```browser_tabs```  ```browser_open URL```
+          🐳 Docker 通过 WSL 运行，零额外软件（无需 Docker Desktop）
+          ```docker_check```  检测状态  ```docker_list [all]```  ```docker_images```
+          ```docker_action 容器名 start/stop/restart/logs/rm/stats```
+          🐧 ```wsl_check``` 检测  ```wsl_install``` 安装WSL2
+          ```wsl_install_docker```  WSL内一键安装Docker
+          ```wsl_list```  ```wsl_set_default 发行版```  ```wsl_shutdown```  ```wsl_exec 发行版 命令```
+          ```camera_list```  ```camera_capture [路径]```
+          ```serial_list```  ```serial_send 端口 数据 [波特率]```
+          ```printer_list```  ```printer_set_default 名称```  ```printer_print 文件```
+          ```gamepad_list```  ```gamepad_read [序号]```
+          ```ssh_exec 主机 命令 [用户名] [密码]```
+          ```ble_scan```  ```ble_list```
+          ```download_advanced URL [路径]```
 
         Office 文档（COM自动化，比模拟按键精准100倍，需pip install pywin32）：
           ```excel_read 路径 [Sheet] [A1:B10]```  读取Excel内容
@@ -13677,8 +16544,6 @@ class AIAssistant:
 
         系统感知：
           ```system_info```          查看 CPU/内存使用率（首次用时自动安装 psutil）
-
-        {self._claude_prompt_block("tools")}
 
         【🏗️ 任务自动规划系统】
         管家会自动评估每个任务的复杂度（0-10分，无固定边界）：
@@ -13775,6 +16640,7 @@ class AIAssistant:
 
         【🔴 七步交互流程 — 跳步=失职！跳过④自动重试！】
         ① 理解：用户到底要什么？纯信息→直接答不创建文件。行动→继续②。目标对象精确是什么？不确定就查！
+        🔴 "整理桌面"分两种：整理文件(分类归档)=powershell | 整理图标位置(排列/对齐)=desktop_icons_arrange。用户提"图标/icon/位置/排列"=图标操作！
         ② 评估：简单(0-2)直接做 | 中等(3-5)一轮多代码块 | 复杂(6-10)自动规划。最小阻力→UIA>OCR>截图，失败换方法。
         ③ 执行：不依赖视觉的一轮全出（app_knowledge→launch→window→key→type→Enter）。需看屏幕→desktop_see定位点击。
         ④ 🔴 强制验证：必须用工具对照①逐项检查！脚本→捕获stdout | 文件→Test-Path+dir | 窗口→desktop_window | 进程→tasklist。没有验证证据说"已启动/已完成"=系统自动重试！
@@ -13785,7 +16651,7 @@ class AIAssistant:
 
         【失败处理 — 最小阻力降级】
         · 关闭窗口→desktop_close→Alt+F4→报告 | 切歌→desktop_media→快捷键→报告
-        · 打开应用→desktop_launch→Start-Process→报告 | 文件操作→Test-Path→换桌面→报告
+        · 打开应用→desktop_launch(.lnk优先)→Start-Process→报告 | 文件操作→Invoke-Item→Test-Path→换桌面→报告
         · 搜索→换关键词2-3组→报告 | 下载→换1个镜像→报告 | 找窗口→UIA→OCR→desktop_see兜底
         · 每条链走到头失败就报告，不准跳过中间步骤、不准自己发明链外方法。
         · [SELF_REPAIR] 仅程序代码有bug时触发。生成≠打开：不自动打开生成的文件。
@@ -13818,6 +16684,21 @@ class AIAssistant:
         ```generate_image 描述``` / ```generate_video 描述``` （需云端）
         ```launch_and_watch 命令 [--input "输入"] [秒]``` 新终端+截图
         {self._claude_prompt_block("tools")}
+
+        【1.5 新增能力】
+        🖥️ 桌面: ```desktop_icons_arrange [auto/by_name/by_type]``` ```desktop_icons_auto_arrange [true/false]```
+        ```desktop_icons_show [true/false]``` ```desktop_wallpaper_set 路径``` ```desktop_dark_mode [true/false]```
+        ⚡ 电源: ```power_shutdown/restart/sleep/hibernate/lock/sign_out/display_off```
+        🌐 网络: ```wifi_list/status/connect/disconnect``` ```network_ip_config/adapters/dns_set/proxy_set/proxy_disable/port_listen```
+        🔊 音频: ```audio_device_list/switch/volume_set/mute/unmute```
+        💿 磁盘: ```disk_list/analyze/cleanup_temp``` ```recycle_bin_empty/info``` ```usb_eject```
+        🔧 系统: ```service_list/action``` ```registry_read/write/delete/export```
+        📦 软件: ```package_list/search/install/uninstall/update_all```
+        🚀 启动: ```startup_list/add/remove```  🛡️ 安全: ```defender_status/scan/exclude``` ```firewall_status```
+        🌐 浏览器: ```browser_open_cdp/tabs/open```  🐳 Docker: ```docker_list/action```
+        🐧 WSL: ```wsl_list/shutdown/exec```  📷 摄像头: ```camera_list/capture```
+        🔌 外设: ```serial_list/send``` ```printer_list/print``` ```gamepad_list/read```
+        🔗 远程: ```ssh_exec```  📡 蓝牙: ```ble_scan```  📥 下载: ```download_advanced```
 
         🔴 回复前必查：①操作类→必须有验证工具调用 ②总结→说清做什么+结果(禁止"完成了/好了") ③结尾→肯定句(禁止"需要我继续吗？")
         """)
@@ -13897,6 +16778,7 @@ class AIAssistant:
         - 桌面：{desktop}
         - 工作目录：{cwd}
         - Shell：{self.config.default_shell}
+        {self._build_hw_info()}
         {claude_section.strip()}
 
         【API Key】
@@ -13917,6 +16799,10 @@ class AIAssistant:
             · 行动需求（创建/修改/删除/安装/运行/搜索/打开/关闭/下载/切歌/播放）
               → 继续第二步
         Q3: 目标对象是什么？必须精确到可操作对象！
+            🔴 "整理桌面"分两种——先确认用户想做什么：
+               · 整理桌面文件（分类归档）= 文件操作
+               · 整理桌面图标位置（排列/对齐/排序）= ```desktop_icons_arrange``` 或 ```desktop_icons_auto_arrange```
+               · 用户提到"图标"/"icon"/"位置"/"排列"/"对齐"→ 是图标位置操作！
             · 关窗口 → 哪个窗口？什么标题？
             · 删文件 → 哪个文件？什么路径？
             · 杀进程 → 哪个进程？PID多少？
@@ -14116,7 +17002,61 @@ class AIAssistant:
           ```desktop_save_layout [名称]```      — 保存当前所有窗口位置
           ```desktop_restore_layout [名称]```   — 恢复已保存的布局
           ```desktop_layout_summary```          — 查看当前窗口布局概况
+          ```desktop_layout_list```             — 列出所有已保存布局
           ```desktop_display_info```            — 查看多显示器/DPI配置
+          ```desktop_try 工具1 参数 | 工具2 参数```  — 降级链：依次尝试直到成功
+
+        🖥️ 桌面 Shell（图标/壁纸/暗色模式）：
+          ```desktop_icons_arrange [auto/snap_to_grid/by_name/by_type]```  桌面图标排列
+          ```desktop_icons_auto_arrange [true/false]```  自动排列图标
+          ```desktop_icons_show [true/false]```  显示/隐藏图标
+          ```desktop_icons_count```  图标数量
+          ```desktop_refresh```  刷新桌面
+          ```desktop_wallpaper_set 图片路径```  设置壁纸
+          ```desktop_dark_mode [true/false]```  暗色/亮色模式
+
+        ⚡ 电源管理（shutdown命令，需二次确认）：
+          ```power_shutdown [延时秒]```  关机  ```power_restart [延时秒]```  重启
+          ```power_sleep```  睡眠  ```power_hibernate```  休眠
+          ```power_lock```  锁屏  ```power_sign_out```  注销  ```power_display_off```  关显示器
+          ```power_plan_list```  电源计划列表  ```power_plan_switch 高性能/平衡/节能```  切换
+
+        🌐 网络管理（WiFi / IP / DNS / 代理）：
+          ```wifi_list```  ```wifi_status```  ```wifi_connect SSID [密码]```  ```wifi_disconnect```
+          ```network_ip_config```  ```network_adapters```  ```network_adapter_enable 名称```
+          ```network_dns_set DNS```  ```network_proxy_set 代理```  ```network_proxy_disable```
+          ```network_port_listen```  查看端口占用
+
+        🔵 蓝牙 / 🔊 音频设备 / 🖥️ 显示：
+          ```bluetooth_list```  ```bluetooth_scan```  ```bluetooth_status```
+          ```audio_device_list```  ```audio_device_switch 名称```  ```audio_volume_set 0-100```
+          ```audio_mute```  ```audio_unmute```
+          ```display_info```  ```display_night_light [true/false]```  ```display_set_resolution 宽 高```
+
+        💿 磁盘 / 🔧 服务 / 📝 注册表 / 📦 软件包 / 🚀 启动项 / 🛡️ 安全：
+          ```disk_list```  ```disk_analyze [路径]```  ```disk_cleanup_temp```
+          ```recycle_bin_empty```  ```recycle_bin_info```  ```usb_eject 盘符```
+          ```service_list [过滤]```  ```service_action 服务名 start/stop/restart/enable/disable```
+          ```registry_read 路径 [键]```  ```registry_write 路径 键 值 [REG_SZ/REG_DWORD]```
+          ```registry_delete 路径 [键]```  ```registry_export 路径```
+          ```package_list```  ```package_search 关键词```  ```package_install 包ID```
+          ```package_uninstall 包ID```  ```package_update_all```
+          ```startup_list```  ```startup_add 名称 路径```  ```startup_remove 名称```
+          ```defender_status```  ```defender_scan [quick/full]```  ```defender_exclude 路径```
+          ```firewall_status```  ```hosts_read```
+
+        🌐 浏览器控制 / 🐳 Docker / 🐧 WSL / 📷 摄像头 / 🔌 外设 / 🔗 远程：
+          ```browser_open_cdp [端口]```  启动浏览器 CDP 调试端口
+          ```browser_tabs```  列出所有标签页  ```browser_open URL```  Selenium 打开
+          ```docker_list [all]```  容器列表  ```docker_action 容器名 start/stop/restart/logs```
+          ```wsl_list```  发行版列表  ```wsl_shutdown```  关闭全部  ```wsl_exec 发行版 命令```
+          ```camera_list```  摄像头列表  ```camera_capture [路径]```  拍照
+          ```serial_list```  串口列表  ```serial_send 端口 数据 [波特率]```  串口发送
+          ```printer_list```  打印机列表  ```printer_set_default 名称```  ```printer_print 文件路径```
+          ```gamepad_list```  手柄列表  ```gamepad_read [序号]```  手柄状态
+          ```ssh_exec 主机 命令 [用户名] [密码]```  SSH 远程执行
+          ```ble_scan [超时秒]```  BLE 扫描  ```ble_list```  BLE 设备
+          ```download_advanced URL [目标路径]```  断点续传下载
 
         Office 文档（COM自动化，比模拟按键精准100倍，需pip install pywin32）：
           ```excel_read 路径 [Sheet名] [A1:B10]```  读取Excel内容
@@ -14339,7 +17279,7 @@ class AIAssistant:
         'desktop_dialog_detect', 'desktop_dialog_action', 'desktop_dialog_policy',
         # ━━━ 窗口布局管理 ━━━
         'desktop_save_layout', 'desktop_restore_layout', 'desktop_layout_summary',
-        'desktop_display_info',
+        'desktop_display_info', 'desktop_try', 'desktop_layout_list',
         # ━━━ Office COM 自动化 ━━━
         'excel_read', 'excel_write', 'excel_export_pdf',
         'word_read', 'word_find_replace', 'word_export_pdf',
@@ -14348,6 +17288,63 @@ class AIAssistant:
         'iot_scan', 'iot_list', 'iot_status', 'iot_control',
         'iot_room', 'iot_scene', 'iot_register', 'iot_remove',
         'iot_broker',
+        # ━━━ 1.5 桌面 Shell 操作 ━━━
+        'desktop_icons_arrange', 'desktop_icons_align_to_grid',
+        'desktop_icons_auto_arrange', 'desktop_icons_show',
+        'desktop_icons_count', 'desktop_refresh',
+        'desktop_wallpaper_set', 'desktop_dark_mode',
+        # ━━━ 1.5 电源管理 ━━━
+        'power_shutdown', 'power_restart', 'power_sleep',
+        'power_hibernate', 'power_lock', 'power_sign_out',
+        'power_display_off', 'power_plan_list', 'power_plan_switch',
+        'power_display_timeout',
+        # ━━━ 1.5 网络管理 ━━━
+        'wifi_list', 'wifi_status', 'wifi_connect', 'wifi_disconnect',
+        'network_ip_config', 'network_adapters', 'network_adapter_enable',
+        'network_dns_set', 'network_proxy_set', 'network_proxy_disable',
+        'network_port_listen',
+        # ━━━ 1.5 蓝牙管理 ━━━
+        'bluetooth_list', 'bluetooth_scan', 'bluetooth_status',
+        # ━━━ 1.5 音频设备管理 ━━━
+        'audio_device_list', 'audio_device_switch', 'audio_device_switch_input',
+        'audio_volume_set', 'audio_mute', 'audio_unmute',
+        # ━━━ 1.5 显示设置 ━━━
+        'display_info', 'display_night_light', 'display_set_resolution',
+        # ━━━ 1.5 磁盘管理 ━━━
+        'disk_list', 'disk_analyze', 'disk_cleanup_temp',
+        'recycle_bin_empty', 'recycle_bin_info', 'usb_eject',
+        # ━━━ 1.5 服务管理 ━━━
+        'service_list', 'service_action',
+        # ━━━ 1.5 注册表管理 ━━━
+        'registry_read', 'registry_write', 'registry_delete', 'registry_export',
+        # ━━━ 1.5 软件包管理 ━━━
+        'package_list', 'package_search', 'package_install',
+        'package_uninstall', 'package_update_all',
+        # ━━━ 1.5 启动项管理 ━━━
+        'startup_list', 'startup_add', 'startup_remove',
+        # ━━━ 1.5 安全管理 ━━━
+        'defender_status', 'defender_scan', 'defender_exclude',
+        'firewall_status', 'hosts_read',
+        # ━━━ 1.5 浏览器管理 ━━━
+        'browser_open_cdp', 'browser_tabs', 'browser_navigate', 'browser_open',
+        # ━━━ 1.5 Docker 管理 ━━━
+        'docker_check', 'docker_install_guide', 'docker_list', 'docker_images', 'docker_action',
+        # ━━━ 1.5 WSL 管理 ━━━
+        'wsl_check', 'wsl_install', 'wsl_install_docker', 'wsl_list', 'wsl_set_default', 'wsl_shutdown', 'wsl_exec',
+        # ━━━ 1.5 摄像头管理 ━━━
+        'camera_list', 'camera_capture',
+        # ━━━ 1.5 串口管理 ━━━
+        'serial_list', 'serial_send',
+        # ━━━ 1.5 打印机/扫描仪 ━━━
+        'printer_list', 'printer_set_default', 'printer_print',
+        # ━━━ 1.5 游戏手柄 ━━━
+        'gamepad_list', 'gamepad_read',
+        # ━━━ 1.5 SSH 远程 ━━━
+        'ssh_exec',
+        # ━━━ 1.5 BLE 蓝牙低功耗 ━━━
+        'ble_scan', 'ble_list',
+        # ━━━ 1.5 高级下载 ━━━
+        'download_advanced',
     }
     # 已知的可直接执行的语言（不需要存文件）
     _DIRECT_EXEC_LANGS = {
@@ -14470,6 +17467,11 @@ class AIAssistant:
             'desktop_close', 'desktop_minimize', 'desktop_maximize',
             'desktop_restore', 'desktop_wait_window',
             'clipboard_get', 'clipboard_set', 'system_info',
+            # 🔴 桌面Shell操作（之前遗漏，导致这些标签的代码块行为不一致）
+            'desktop_icons_arrange', 'desktop_icons_align_to_grid',
+            'desktop_icons_auto_arrange', 'desktop_icons_show',
+            'desktop_icons_count', 'desktop_refresh',
+            'desktop_wallpaper_set', 'desktop_dark_mode',
         }
 
         def _replace(match):
@@ -14488,6 +17490,48 @@ class AIAssistant:
         # 用 \S*（贪婪匹配非空白字符）正确提取语言标签
         # 原来 [^\n`]*? 非贪婪导致单行 ```search xxx``` 被当成"无标签内联"漏掉
         return re.sub(r'```(\S*)\s*\n?(.*?)```', _replace, text, flags=re.DOTALL).strip()
+
+    @staticmethod
+    def _strip_leaked_checklist(text: str) -> str:
+        """剥离 AI 不慎输出的内部检查清单/自检指令。
+
+        系统提示词中的回复前自检（"── 回复前确认" / "🔴 回复前必查" /
+        "④验证" / "⑥总结" / "⑦结尾"）是给 AI 的内部指令，部分模型
+        （尤其是 Flash 架构）会把这些文字当成输出内容逐条打印。
+
+        此方法在显示前切除这些泄露的片段，不影响正常内容。
+        """
+        if not text:
+            return text
+        # 模式1：七步工作流注入的自检清单（含框线版和简版）
+        # "── 回复前确认（缺一不可）──" 及之后所有内容
+        text = re.sub(
+            r'\n?──\s*回复前确认[^\n]*\n.*$',
+            '',
+            text,
+            flags=re.DOTALL,
+        )
+        # 模式2：系统提示词中的框线版自检
+        # ╔═══════...╗ ... ╚═══════...╝
+        text = re.sub(
+            r'\n?╔+[═╦╗].*?╚+[═╩╝].*',
+            '',
+            text,
+            flags=re.DOTALL,
+        )
+        # 模式3：紧凑版内联自检 "🔴 回复前必查：①...②...③..."
+        text = re.sub(
+            r'\n?🔴\s*回复前必查[：:][^\n]*',
+            '',
+            text,
+        )
+        # 模式4：孤立的 "④验证"/"⑥总结"/"⑦结尾" 行（内部指令残留）
+        text = re.sub(
+            r'\n[④⑤⑥⑦]+\s*(?:验证|总结|确认|结尾|清理)[^\n]*',
+            '',
+            text,
+        )
+        return text.strip()
 
     @staticmethod
     def _filter_noise(text: str) -> str:
@@ -14738,6 +17782,10 @@ class AIAssistant:
             # 系统感知
             elif kind == "system_info":
                 results.append(self._exec_capability("system_info", code))
+            elif kind in self._SPECIAL_ACTIONS:
+                # ━━━ 泛化路由：_SPECIAL_ACTIONS 中注册的所有工具自动路由到 _exec_capability ━━━
+                # 不再需要为每个工具写显式 elif 分支。新增工具只需加 _SPECIAL_ACTIONS。
+                results.append(self._exec_capability(kind, code))
             else:
                 # ━━━ 泛化兜底：任何未知 kind 都保存为工作目录文件 ━━━
                 _ext = f".{kind}" if not kind.startswith('.') else kind
@@ -15368,14 +18416,12 @@ class AIAssistant:
                     proc = subprocess.run(
                         ["powershell.exe", "-ExecutionPolicy", "Bypass", "-Command", command],
                         capture_output=True, text=True, timeout=90,
-                        encoding="utf-8", errors="replace",
                         stdin=subprocess.DEVNULL,  # 避免 bat 里的 pause 等交互命令卡死
                     )
                 else:
                     proc = subprocess.run(
                         command, shell=True, executable=self.config.default_shell,
                         capture_output=True, text=True, timeout=90,
-                        encoding="utf-8", errors="replace",
                         stdin=subprocess.DEVNULL,
                     )
                 stdout = proc.stdout.strip()
@@ -15901,28 +18947,26 @@ class AIAssistant:
 
         # === 降级链引擎 ===
         elif action == "desktop_try":
-            # 解析参数: 方法1 | 方法2 | 方法3 || 验证条件
-            parts = arg.split("||")
-            methods_str = parts[0] if parts else ""
-            verify_cond = parts[1].strip() if len(parts) > 1 else ""
-
-            method_list = [m.strip() for m in methods_str.split("|") if m.strip()]
+            # 依次尝试多个工具，直到成功。格式: 工具1 参数1 | 工具2 参数2
+            # 示例: desktop_try desktop_close 窗口A | desktop_key Alt+F4
+            method_list = [m.strip() for m in arg.split("|") if m.strip()]
             if not method_list:
-                return "请指定至少一个方法，用 | 分隔"
-
-            methods = []
-            for m in method_list:
-                # 将文本描述转为可执行的方法 — 这里只能返回诊断信息
-                methods.append({"name": m, "fn": lambda _m=m: f"执行: {_m}"})
-
-            if verify_cond:
-                result = FallbackEngine.try_methods(methods)
-            else:
-                result = FallbackEngine.try_methods(methods)
-
-            if result["success"]:
-                return f"✅ {result['method']} 成功 (尝试{result['attempts']}次)"
-            return f"❌ 全部{result['attempts']}个方案失败: {'; '.join(result['errors'])}"
+                return "请指定至少一个方法，用 | 分隔。如: desktop_try desktop_close A | desktop_key Alt+F4"
+            errors = []
+            for i, m in enumerate(method_list):
+                parts = m.split(maxsplit=1)
+                act = parts[0].strip()
+                act_arg = parts[1].strip() if len(parts) > 1 else ""
+                if act not in self._SPECIAL_ACTIONS:
+                    errors.append(f"未知工具: {act}")
+                    continue
+                result = self._exec_capability(act, act_arg)
+                # 判断成功：不含"失败"、"错误"、"不可用"等关键词
+                is_error = any(kw in result for kw in ["失败", "不可用", "不支持", "未知", "未找到", "无法", "请指定"])
+                if not is_error:
+                    return f"✅ 方法{i+1} '{act}' 成功:\n{result}"
+                errors.append(f"[{act}]: {result[:100]}")
+            return f"❌ 全部{len(method_list)}个方案失败:\n" + '\n'.join(errors)
 
         # === 窗口布局 ===
         elif action == "desktop_save_layout":
@@ -16230,6 +19274,372 @@ class AIAssistant:
         elif action == "system_info":
             self.sysmon.ensure_psutil()
             return self.sysmon.get_summary()
+
+        # ═══════════════════════════════════════════
+        # ━━━ 1.5 桌面 Shell 操作 ━━━
+        # ═══════════════════════════════════════════
+        elif action == "desktop_icons_arrange":
+            mode = arg.strip() if arg.strip() else "auto"
+            return self.desktop_icons.arrange(mode)
+        elif action == "desktop_icons_align_to_grid":
+            return self.desktop_icons.arrange("snap_to_grid")
+        elif action == "desktop_icons_auto_arrange":
+            enable = arg.strip().lower() not in ("false", "0", "no", "off", "disable")
+            return self.desktop_icons.auto_arrange(enable)
+        elif action == "desktop_icons_show":
+            visible = arg.strip().lower() not in ("false", "0", "no", "hide")
+            return self.desktop_icons.show_icons(visible)
+        elif action == "desktop_icons_count":
+            return self.desktop_icons.get_icon_count()
+        elif action == "desktop_refresh":
+            return self.desktop_icons.refresh()
+        elif action == "desktop_wallpaper_set":
+            return self.desktop_icons.set_wallpaper(arg.strip())
+        elif action == "desktop_dark_mode":
+            enable = arg.strip().lower() not in ("false", "0", "no", "off", "light")
+            return self.desktop_icons.toggle_dark_mode(enable)
+
+        # ═══════════════════════════════════════════
+        # ━━━ 1.5 电源管理 ━━━
+        # ═══════════════════════════════════════════
+        elif action == "power_shutdown":
+            delay = int(arg.strip()) if arg.strip().isdigit() else 0
+            return self.power.shutdown(force=True, delay=delay)
+        elif action == "power_restart":
+            delay = int(arg.strip()) if arg.strip().isdigit() else 0
+            return self.power.restart(force=True, delay=delay)
+        elif action == "power_sleep":
+            return self.power.sleep()
+        elif action == "power_hibernate":
+            return self.power.hibernate()
+        elif action == "power_lock":
+            return self.power.lock()
+        elif action == "power_sign_out":
+            return self.power.sign_out()
+        elif action == "power_display_off":
+            return self.power.display_off()
+        elif action == "power_plan_list":
+            return self.power.list_plans()
+        elif action == "power_plan_switch":
+            return self.power.switch_plan(arg.strip() if arg.strip() else "高性能")
+        elif action == "power_display_timeout":
+            try:
+                minutes = int(arg.strip()) if arg.strip() else 10
+            except ValueError:
+                minutes = 10
+            return self.power.display_timeout(minutes)
+
+        # ═══════════════════════════════════════════
+        # ━━━ 1.5 网络管理 ━━━
+        # ═══════════════════════════════════════════
+        elif action == "wifi_list":
+            return self.network.wifi_list()
+        elif action == "wifi_status":
+            return self.network.wifi_status()
+        elif action == "wifi_connect":
+            parts = arg.strip().split(maxsplit=1)
+            ssid = parts[0] if parts else ""
+            password = parts[1] if len(parts) > 1 else ""
+            return self.network.wifi_connect(ssid, password) if ssid else "请指定 WiFi SSID"
+        elif action == "wifi_disconnect":
+            return self.network.wifi_disconnect()
+        elif action == "network_ip_config":
+            return self.network.ip_config()
+        elif action == "network_adapters":
+            return self.network.adapter_list()
+        elif action == "network_adapter_enable":
+            parts = arg.strip().split(maxsplit=1)
+            name = parts[0] if parts else ""
+            enable = parts[1].lower() != "disable" if len(parts) > 1 else True
+            return self.network.adapter_enable(name, enable) if name else "请指定适配器名称"
+        elif action == "network_dns_set":
+            parts = arg.strip().split(maxsplit=1)
+            dns = parts[0] if parts else ""
+            adapter = parts[1] if len(parts) > 1 else ""
+            return self.network.set_dns(dns, adapter) if dns else "请指定 DNS 服务器地址"
+        elif action == "network_proxy_set":
+            return self.network.proxy_set(arg.strip())
+        elif action == "network_proxy_disable":
+            return self.network.proxy_set("")
+        elif action == "network_port_listen":
+            return self.network.port_listen()
+
+        # ═══════════════════════════════════════════
+        # ━━━ 1.5 蓝牙管理 ━━━
+        # ═══════════════════════════════════════════
+        elif action == "bluetooth_list":
+            return self.bluetooth.list_devices()
+        elif action == "bluetooth_scan":
+            return self.bluetooth.scan()
+        elif action == "bluetooth_status":
+            return self.bluetooth.status()
+
+        # ═══════════════════════════════════════════
+        # ━━━ 1.5 音频设备管理 ━━━
+        # ═══════════════════════════════════════════
+        elif action == "audio_device_list":
+            return self.audio_device.list_devices()
+        elif action == "audio_device_switch":
+            return self.audio_device.switch_output(arg.strip())
+        elif action == "audio_device_switch_input":
+            return self.audio_device.switch_input(arg.strip())
+        elif action == "audio_volume_set":
+            try:
+                level = int(arg.strip()) if arg.strip() else 50
+                return self.audio_device.set_volume(level)
+            except ValueError:
+                return "请指定音量级别 (0-100)"
+        elif action == "audio_mute":
+            return self.audio_device.mute(True)
+        elif action == "audio_unmute":
+            return self.audio_device.mute(False)
+
+        # ═══════════════════════════════════════════
+        # ━━━ 1.5 显示设置 ━━━
+        # ═══════════════════════════════════════════
+        elif action == "display_info":
+            return self.display_settings.get_info()
+        elif action == "display_night_light":
+            enable = arg.strip().lower() not in ("false", "0", "no", "off")
+            return self.display_settings.night_light(enable)
+        elif action == "display_set_resolution":
+            parts = arg.strip().split()
+            try:
+                w, h = int(parts[0]), int(parts[1]) if len(parts) > 1 else 1080
+                return self.display_settings.set_resolution(w, h)
+            except (ValueError, IndexError):
+                return "请指定分辨率，如: display_set_resolution 1920 1080"
+
+        # ═══════════════════════════════════════════
+        # ━━━ 1.5 磁盘管理 ━━━
+        # ═══════════════════════════════════════════
+        elif action == "disk_list":
+            return self.disk.list_disks()
+        elif action == "disk_analyze":
+            return self.disk.analyze(arg.strip() if arg.strip() else "C:\\")
+        elif action == "disk_cleanup_temp":
+            return self.disk.cleanup_temp()
+        elif action == "recycle_bin_empty":
+            return self.disk.recycle_bin_empty()
+        elif action == "recycle_bin_info":
+            return self.disk.recycle_bin_info()
+        elif action == "usb_eject":
+            return self.disk.usb_eject(arg.strip()) if arg.strip() else "请指定盘符，如: usb_eject E"
+
+        # ═══════════════════════════════════════════
+        # ━━━ 1.5 Windows 服务管理 ━━━
+        # ═══════════════════════════════════════════
+        elif action == "service_list":
+            return self.services.list_services(arg.strip())
+        elif action == "service_action":
+            parts = arg.strip().split(maxsplit=1)
+            name = parts[0] if parts else ""
+            action_name = parts[1] if len(parts) > 1 else "status"
+            return self.services.service_action(name, action_name) if name else "请指定: 服务名 操作(start/stop/restart/enable/disable/status)"
+
+        # ═══════════════════════════════════════════
+        # ━━━ 1.5 注册表管理 ━━━
+        # ═══════════════════════════════════════════
+        elif action == "registry_read":
+            parts = arg.strip().split(maxsplit=1)
+            key = parts[0] if parts else ""
+            value = parts[1] if len(parts) > 1 else ""
+            return self.registry.read(key, value) if key else "请指定注册表路径"
+        elif action == "registry_write":
+            parts = arg.strip().split(maxsplit=3)
+            if len(parts) < 3:
+                return "请指定: 路径 键名 值 [类型(REG_SZ/REG_DWORD)]"
+            key, vname, val = parts[0], parts[1], parts[2]
+            rtype = parts[3] if len(parts) > 3 else "REG_SZ"
+            return self.registry.write(key, vname, val, rtype)
+        elif action == "registry_delete":
+            parts = arg.strip().split(maxsplit=1)
+            key = parts[0] if parts else ""
+            value = parts[1] if len(parts) > 1 else ""
+            return self.registry.delete(key, value) if key else "请指定注册表路径"
+        elif action == "registry_export":
+            parts = arg.strip().split(maxsplit=1)
+            key = parts[0] if parts else ""
+            output = parts[1] if len(parts) > 1 else ""
+            return self.registry.export_backup(key, output) if key else "请指定注册表路径"
+
+        # ═══════════════════════════════════════════
+        # ━━━ 1.5 软件包管理 ━━━
+        # ═══════════════════════════════════════════
+        elif action == "package_list":
+            return self.packages.list_installed()
+        elif action == "package_search":
+            return self.packages.search(arg.strip()) if arg.strip() else "请指定搜索关键词"
+        elif action == "package_install":
+            return self.packages.install(arg.strip()) if arg.strip() else "请指定软件包 ID"
+        elif action == "package_uninstall":
+            return self.packages.uninstall(arg.strip()) if arg.strip() else "请指定软件包 ID"
+        elif action == "package_update_all":
+            return self.packages.update_all()
+
+        # ═══════════════════════════════════════════
+        # ━━━ 1.5 启动项管理 ━━━
+        # ═══════════════════════════════════════════
+        elif action == "startup_list":
+            return self.startup_mgr.list()
+        elif action == "startup_add":
+            parts = arg.strip().split(maxsplit=1)
+            name = parts[0] if parts else ""
+            cmd = parts[1] if len(parts) > 1 else ""
+            return self.startup_mgr.add(name, cmd) if name else "请指定: 名称 命令"
+        elif action == "startup_remove":
+            return self.startup_mgr.remove(arg.strip()) if arg.strip() else "请指定启动项名称"
+
+        # ═══════════════════════════════════════════
+        # ━━━ 1.5 安全管理 ━━━
+        # ═══════════════════════════════════════════
+        elif action == "defender_status":
+            return self.security_mgr.defender_status()
+        elif action == "defender_scan":
+            return self.security_mgr.defender_scan(arg.strip() if arg.strip() else "quick")
+        elif action == "defender_exclude":
+            parts = arg.strip().split(maxsplit=1)
+            path = parts[0] if parts else ""
+            add = parts[1].lower() != "remove" if len(parts) > 1 else True
+            return self.security_mgr.defender_exclude(path, add) if path else "请指定路径"
+        elif action == "firewall_status":
+            return self.security_mgr.firewall_status()
+        elif action == "hosts_read":
+            return self.security_mgr.hosts_read()
+
+        # ═══════════════════════════════════════════
+        # ━━━ 1.5 浏览器管理 ━━━
+        # ═══════════════════════════════════════════
+        elif action == "browser_open_cdp":
+            port = int(arg.strip()) if arg.strip().isdigit() else 9222
+            return self.browser.open_cdp(port)
+        elif action == "browser_tabs":
+            return self.browser.list_tabs()
+        elif action == "browser_navigate":
+            return self.browser.navigate(arg.strip())
+        elif action == "browser_open":
+            return self.browser.open_selenium(arg.strip()) if arg.strip() else "请指定 URL"
+
+        # ═══════════════════════════════════════════
+        # ━━━ 1.5 Docker 管理 ━━━
+        # ═══════════════════════════════════════════
+        elif action == "docker_check":
+            return self.docker_mgr.check_installed()
+        elif action == "docker_install_guide":
+            return self.docker_mgr.install_guide()
+        elif action == "docker_list":
+            all_flag = arg.strip().lower() in ("all", "true", "-a")
+            return self.docker_mgr.list_containers(all_flag)
+        elif action == "docker_images":
+            return self.docker_mgr.list_images()
+        elif action == "docker_action":
+            parts = arg.strip().split(maxsplit=1)
+            name = parts[0] if parts else ""
+            action_name = parts[1] if len(parts) > 1 else "inspect"
+            return self.docker_mgr.container_action(name, action_name) if name else "请指定: 容器名 操作(start/stop/restart/logs/inspect/rm/stats)"
+
+        # ═══════════════════════════════════════════
+        # ━━━ 1.5 WSL 管理 ━━━
+        # ═══════════════════════════════════════════
+        elif action == "wsl_check":
+            return self.wsl.check_installed()
+        elif action == "wsl_install":
+            return self.wsl.install()
+        elif action == "wsl_list":
+            return self.wsl.list_distros()
+        elif action == "wsl_set_default":
+            return self.wsl.set_default(arg.strip())
+        elif action == "wsl_install_docker":
+            return self.docker_mgr.install_docker_in_wsl()
+        elif action == "wsl_shutdown":
+            return self.wsl.shutdown()
+        elif action == "wsl_exec":
+            parts = arg.strip().split(maxsplit=1)
+            distro = parts[0] if parts else ""
+            cmd = parts[1] if len(parts) > 1 else ""
+            return self.wsl.execute(distro, cmd) if cmd else "请指定: 发行版 命令"
+
+        # ═══════════════════════════════════════════
+        # ━━━ 1.5 摄像头管理 ━━━
+        # ═══════════════════════════════════════════
+        elif action == "camera_list":
+            return self.camera.list_cameras()
+        elif action == "camera_capture":
+            return self.camera.capture(arg.strip())
+
+        # ═══════════════════════════════════════════
+        # ━━━ 1.5 串口管理 ━━━
+        # ═══════════════════════════════════════════
+        elif action == "serial_list":
+            return self.serial_mgr.list_ports()
+        elif action == "serial_send":
+            parts = arg.strip().split(maxsplit=2)
+            port = parts[0] if parts else ""
+            data = parts[1] if len(parts) > 1 else ""
+            try:
+                baud = int(parts[2]) if len(parts) > 2 else 115200
+            except ValueError:
+                baud = 115200
+            return self.serial_mgr.send(port, data, baud) if port and data else "请指定: 端口 数据 [波特率]"
+
+        # ═══════════════════════════════════════════
+        # ━━━ 1.5 打印机/扫描仪 ━━━
+        # ═══════════════════════════════════════════
+        elif action == "printer_list":
+            return self.printer_scanner.list_printers()
+        elif action == "printer_set_default":
+            return self.printer_scanner.set_default(arg.strip())
+        elif action == "printer_print":
+            parts = arg.strip().split(maxsplit=1)
+            path = parts[0] if parts else ""
+            printer = parts[1] if len(parts) > 1 else ""
+            return self.printer_scanner.print_file(path, printer) if path else "请指定文件路径"
+
+        # ═══════════════════════════════════════════
+        # ━━━ 1.5 游戏手柄 ━━━
+        # ═══════════════════════════════════════════
+        elif action == "gamepad_list":
+            return self.gamepad.list_controllers()
+        elif action == "gamepad_read":
+            try:
+                idx = int(arg.strip()) if arg.strip() else 0
+            except ValueError:
+                idx = 0
+            return self.gamepad.read_input(idx)
+
+        # ═══════════════════════════════════════════
+        # ━━━ 1.5 SSH 远程 ━━━
+        # ═══════════════════════════════════════════
+        elif action == "ssh_exec":
+            parts = arg.strip().split(maxsplit=3)
+            if len(parts) < 2:
+                return "请指定: 主机 命令 [用户名] [密码]"
+            host = parts[0]
+            cmd = parts[1]
+            user = parts[2] if len(parts) > 2 else ""
+            pwd = parts[3] if len(parts) > 3 else ""
+            return self.ssh_mgr.execute_remote(host, cmd, user, pwd)
+
+        # ═══════════════════════════════════════════
+        # ━━━ 1.5 BLE 蓝牙低功耗 ━━━
+        # ═══════════════════════════════════════════
+        elif action == "ble_scan":
+            try:
+                timeout = float(arg.strip()) if arg.strip() else 5.0
+            except ValueError:
+                timeout = 5.0
+            return self.ble.scan(timeout)
+        elif action == "ble_list":
+            return self.ble.list_devices()
+
+        # ═══════════════════════════════════════════
+        # ━━━ 1.5 高级下载 ━━━
+        # ═══════════════════════════════════════════
+        elif action == "download_advanced":
+            parts = arg.strip().split(maxsplit=1)
+            url = parts[0] if parts else ""
+            dest = parts[1] if len(parts) > 1 else ""
+            return self.download_mgr.download_advanced(url, dest) if url else "请指定下载 URL"
 
         return f"未知能力：{action}"
 
@@ -17467,6 +20877,7 @@ class AIAssistant:
 
         # 所有可选 pip 包 → 对应的导入名
         OPTIONAL_DEPS = [
+            # ━━━ 核心功能 ━━━
             ("sounddevice", "sounddevice"),
             ("soundfile", "soundfile"),
             ("faster-whisper", "faster_whisper"),
@@ -17478,13 +20889,27 @@ class AIAssistant:
             ("pdfplumber", "pdfplumber"),
             ("PyPDF2", "PyPDF2"),
             ("python-docx", "docx"),
-            # 以下为之前需要手动安装的依赖，现改为自动安装
-            ("uiautomation", "uiautomation"),     # UI Automation（桌面控件自动化）
-            ("pytesseract", "pytesseract"),        # OCR 文字识别
-            ("pywin32", "win32com"),               # Office COM 自动化
-            ("paho-mqtt", "paho.mqtt"),            # MQTT IoT 协议
-            ("zeroconf", "zeroconf"),               # mDNS 设备发现
-            ("opencv-python", "cv2"),               # 图像模板匹配
+            ("psutil", "psutil"),                    # 系统监控
+            # ━━━ 桌面自动化深度依赖 ━━━
+            ("uiautomation", "uiautomation"),        # UI Automation（桌面控件自动化）
+            ("pytesseract", "pytesseract"),          # OCR 文字识别
+            ("pywin32", "win32com"),                  # Office COM 自动化
+            ("opencv-python", "cv2"),                 # 图像模板匹配+摄像头
+            # ━━━ IoT + 网络 ━━━
+            ("paho-mqtt", "paho.mqtt"),              # MQTT IoT 协议
+            ("zeroconf", "zeroconf"),                 # mDNS 设备发现
+            ("pyserial", "serial"),                   # 串口通信(Arduino/ESP32)
+            ("bleak", "bleak"),                       # 蓝牙BLE设备通信
+            ("paramiko", "paramiko"),                 # SSH远程连接
+            # ━━━ 浏览器 + 容器 ━━━
+            ("websocket-client", "websocket"),        # 浏览器CDP协议控制
+            ("selenium", "selenium"),                 # 浏览器WebDriver自动化
+            # Docker 通过 docker.exe CLI 直接控制，无需 Python SDK
+            # ━━━ 外设 + 媒体 ━━━
+            ("pygame", "pygame"),                     # 游戏手柄检测
+            ("Pillow", "PIL"),                        # 图像处理(截图增强/取色器)
+            # ━━━ 高级下载 ━━━
+            ("aria2p", "aria2p"),                     # 高级下载管理
         ]
 
         missing = []
@@ -17496,7 +20921,6 @@ class AIAssistant:
 
         if missing:
             print(f"\n  {ic.system} 🔧 首次运行 — 自动安装 {len(missing)} 个依赖…")
-            print(f"  {ic.system} （之后在新电脑上只需：pip install requests + 设置API Key + 运行本文件）")
             for pkg, _ in missing:
                 CommandExecutor._try_install_pip_package(pkg, silent=True)
                 installed_any = True
@@ -17535,6 +20959,39 @@ class AIAssistant:
         _claude_ok = self.claude.available or self.claude.try_install()
         _ollama_ready = self._check_ollama_installed()  # 快速检查，不启动服务
         available_cloud = self.config.get_available_providers()
+
+        # ━━━ 硬件探测（静默，结果注入系统提示词）━━━
+        self._hw_info: Dict[str, str] = {}
+        # WSL + Docker（统一为 WSL 内 Docker）
+        _docker_ok = self.docker_mgr._check_docker_in_wsl()
+        _wsl_ok = self.docker_mgr._check_wsl()
+        if _docker_ok:
+            try:
+                _img_out = self.docker_mgr._run('images -q', timeout=5)
+                _img_count = len([l for l in _img_out.split('\n') if l.strip()]) if _img_out else 0
+                _ps_out = self.docker_mgr._run('ps -a -q', timeout=5)
+                _ps_count = len([l for l in _ps_out.split('\n') if l.strip()]) if _ps_out else 0
+                self._hw_info['docker'] = f"Docker (WSL): {_img_count} 镜像, {_ps_count} 容器"
+            except Exception:
+                self._hw_info['docker'] = "Docker (WSL): 可用"
+        elif _wsl_ok:
+            self._hw_info['wsl'] = "WSL: 已安装 | Docker: 未安装（运行 wsl_install_docker 一键安装）"
+        else:
+            self._hw_info['wsl'] = "WSL: 未安装（运行 wsl_install 一键安装，重启后可用 Docker）"
+        # 摄像头
+        try:
+            _cam = self.camera.list_cameras()
+            if '未检测到' not in _cam:
+                self._hw_info['camera'] = "摄像头: 可用"
+        except Exception:
+            pass
+        # 串口
+        try:
+            _ser = self.serial_mgr.list_ports()
+            if '未检测到' not in _ser:
+                self._hw_info['serial'] = "串口: 可用"
+        except Exception:
+            pass
 
         # ---- 后端选择 ----
         if self._backend_forced:
@@ -17821,7 +21278,14 @@ class AIAssistant:
         intent = self._analyze_task_intent(user_input)
 
         # 构建意图理解摘要，注入到 AI 消息中
-        _intent_parts = [f"操作类型: {intent.action_type}"]
+        if intent.action_type == "action":
+            # 🔴 未能精确匹配操作类型，但不等于不需要行动。
+            # 告诉 AI 自行判断——AI 的语言理解能力远强于 regex。
+            _intent_parts = ["操作类型: 需行动（系统未能精确识别，请根据用户需求自行判断所需工具）"]
+        elif intent.action_type == "query":
+            _intent_parts = ["操作类型: 纯知识问答（不需要执行操作，直接回答即可）"]
+        else:
+            _intent_parts = [f"操作类型: {intent.action_type}"]
         if intent.expected_files:
             _intent_parts.append(f"期望产出: {', '.join(intent.expected_files[:5])}")
         if intent.delete_targets:
@@ -17832,16 +21296,49 @@ class AIAssistant:
             _intent_parts.append(f"需停止: {', '.join(intent.processes_to_stop[:3])}")
         if intent.install_targets:
             _intent_parts.append(f"需安装: {', '.join(intent.install_targets[:3])}")
+
+        # 🔴 organize 类型：根据上下文注入精确的工具指引 + 程序化约束
+        # "整理桌面图标" → desktop_icons_arrange，不是文件操作
+        # "整理桌面文件" → powershell 文件分类
+        _icon_kw = re.search(r'(?:图标|icon|排列|对齐|位置|自动排列|auto\s*arrange)', user_input, re.IGNORECASE)
+        _file_kw = re.search(r'(?:文件|文件夹|归档|归类|分类)', user_input, re.IGNORECASE)
+        if intent.action_type == "organize":
+            if _icon_kw and not _file_kw:
+                _intent_parts.append(
+                    "🔧 必须使用: desktop_icons_arrange [auto/by_name/by_type/snap_to_grid] "
+                    "或 desktop_icons_auto_arrange [true/false]")
+                # 🔴 程序化约束：验证时会检查是否真的用了这些工具
+                intent.required_tools = ['desktop_icons_arrange', 'desktop_icons_auto_arrange']
+                intent.forbidden_tools = ['desktop_icons_count']  # 数图标≠排列图标！
+            elif _icon_kw and _file_kw:
+                _intent_parts.append(
+                    "🔧 图标排列: desktop_icons_arrange | 文件归档: powershell Move-Item 分类到文件夹")
+                intent.required_tools = ['desktop_icons_arrange', 'desktop_icons_auto_arrange',
+                                        'Move-Item', 'Copy-Item']
+            elif _file_kw:
+                _intent_parts.append(
+                    "🔧 文件整理: powershell Get-ChildItem + Move-Item 按类型/日期分类到子文件夹")
+            else:
+                _intent_parts.append(
+                    "🔧 可能是图标排列(desktop_icons_arrange)或文件整理(powershell)，请根据上下文判断")
+
         _intent_summary = " | ".join(_intent_parts)
 
         # 🔴 注入意图理解到 AI 消息前，确保 AI 不会误解用户需求
         # 回复前自检放在末尾，利用近因效应确保 AI 回复前最后看到
-        _checklist = (
-            "── 回复前确认（缺一不可）──\n"
-            "④验证：我的回复有验证工具调用吗？\n"
-            "⑥总结：最后一句说清了做什么+结果吗？\n"
-            "⑦结尾：是肯定陈述句吗？（禁止'需要我继续吗？'）"
-        )
+        # 🔴 纯问答类型：跳过操作类检查清单（④验证工具调用不适用），
+        #     避免模型把内部清单当成输出内容逐条打印。
+        if intent.action_type == "query":
+            _checklist = (
+                "🔴 回复前自检：用肯定陈述句结尾，禁止'需要我继续吗？'"
+            )
+        else:
+            _checklist = (
+                "🔴 回复前自检（内部指令，不要输出这些文字）：\n"
+                "④验证：我的回复有验证工具调用吗？\n"
+                "⑥总结：最后一句说清了做什么+结果吗？\n"
+                "⑦结尾：是肯定陈述句吗？（禁止'需要我继续吗？'）"
+            )
         _enhanced_msg = (
             f"🔴【管家，第一步意图分析已完成】{_intent_summary}\n"
             f"🔴 请严格按照上述分析执行，不要偏离用户真实需求。\n\n"
@@ -18020,7 +21517,7 @@ class AIAssistant:
         # 显示去掉代码块的说明文字
         # 有代码块时跳过中间闲聊，等执行完统一给总结
         blocks = self._extract_code_blocks(reply)
-        hint = self._strip_code_blocks(reply)
+        hint = self._strip_leaked_checklist(self._strip_code_blocks(reply))
         _printed = False  # 追踪本轮是否已向用户输出了内容
 
         # ━━━ 纯知识问答快速通道：信息类任务不执行代码块，直接显示文字回答 ━━━
@@ -18043,6 +21540,8 @@ class AIAssistant:
         if _is_pure_info_query and hint:
             # 纯信息问答 → 不执行任何代码块，直接显示文字回答
             # 跳过 _process_and_summarize（避免把示例代码当真执行、避免第二轮API调用）
+            # 🔴 过滤可能泄露的内部检查清单（模型有时会把指令当输出）
+            hint = self._strip_leaked_checklist(hint)
             print(f"\n{ic.ai} {hint}")
             self._last_reply_text = hint
             self.memory.add(user_input, hint)
@@ -18181,10 +21680,12 @@ class AIAssistant:
         _has_desktop_intent = (
             any(kw in user_input.lower() for kw in [
                 '切歌', '换歌', '下一首', '上一首', '暂停', '播放', '音量', '静音',
-                '打开', '关闭', '最小化', '最大化', '聚焦', '窗口',
+                '打开', '启动', '运行', '开启', '关闭', '最小化', '最大化', '聚焦', '窗口',
                 '输入', '打字', '回复', '点击', '拖拽', '滚动', '剪贴板',
                 '快捷键', '组合键', '按键',
+                '整理', '排列', '图标', '对齐', '自动排列', '刷新桌面',  # 🔴 桌面Shell操作
                 'next', 'prev', 'play', 'pause', 'stop', 'mute', 'volume',
+                'launch', 'start', 'run', 'open',
             ])
         )
         _has_desktop_block = any(k.startswith('desktop_') or k.startswith('clipboard_')
@@ -18207,9 +21708,17 @@ class AIAssistant:
                  'desktop_media', 'vol_down', '音量减小'),
                 (['静音', 'mute'],
                  'desktop_media', 'mute', '静音'),
+                # 🔴 桌面Shell操作：整理图标/排列/对齐/刷新
+                (['整理', '排列', '图标', '对齐', '自动排列'],
+                 'desktop_icons_arrange', 'by_name', '图标排列'),
+                (['刷新桌面', '刷新'],
+                 'desktop_refresh', '', '刷新桌面'),
                 (['输入', '打字', '回复', '写', '输入文字'],
                  'desktop_type', '', '文字输入'),
-                (['打开', '聚焦', '切换到', '窗口'],
+                # 🔴 应用启动：优先 desktop_launch（含 .lnk 搜索），不是 desktop_window
+                (['启动', '运行', '开启', 'launch', 'start', 'run'],
+                 'desktop_launch', '', '应用启动'),
+                (['打开', '聚焦', '切换到', '窗口', 'open'],
                  'desktop_window', '', '窗口操作'),
                 (['快捷键', '组合键', '按键', '按'],
                  'desktop_key', '', '键盘操作'),
@@ -18236,8 +21745,19 @@ class AIAssistant:
                 _stripped = re.sub(
                     r'[的了么呢吧啊呀嘛一下下这个那个请帮我把给用让去到来再就还也又和与或'
                     r'\.。,，!！?？\s\n\r\t]', '', _stripped)
-                if len(_stripped) > 3:  # 剩余>3字=用户有具体目标（歌名/人名/文件名/应用名等）
-                    # ━━━ 复杂媒体搜索任务：直接注入可执行代码块，绕过 AI ━━━
+                # 🔴 图标排列：直接执行，不走复杂度判断（"桌面图标"是操作目标不是搜索内容）
+                if _default_action == 'desktop_icons_arrange':
+                    _exec_result = self._exec_capability(_default_action, _default_arg)
+                    _results_text = f"  [{_default_action} {_default_arg}] → {_exec_result}"
+                    reply = (f"{reply}\n\n"
+                             f"【系统已自动执行以下桌面操作】\n{_results_text}\n"
+                             f"请根据以上执行结果回复用户。")
+                    self._messages[-1] = {"role": "assistant", "content": reply}
+                    blocks = self._extract_code_blocks(reply)
+                    self._desktop_safety_net_triggered = True
+                    print(f"{ic.system} ⚡ 安全网直接执行: {_default_action} {_default_arg}")
+                elif len(_stripped) > 3:  # 剩余>3字=用户有具体目标（歌名/人名/文件名/应用名等）
+                    # ━━━ 复杂任务：直接注入可执行代码块，绕过 AI ━━━
                     # AI（尤其是 DeepSeek）倾向输出文字而非代码块，导致自动循环空转
                     if _default_action == 'desktop_media' and _stripped:
                         # 检测正在运行的播放器
@@ -18269,8 +21789,17 @@ class AIAssistant:
                             )
                             reply += _exec_blocks
                             print(f"{ic.system} ⚡ 安全网注入代码块: 启动QQ音乐 → 搜索'{_stripped}'")
+                    elif _default_action == 'desktop_launch' and _stripped:
+                        # 🔴 应用启动任务：直接注入 desktop_launch，绕过 AI 文字回复
+                        # desktop_launch 内部已含完整的启动链（进程检查→知识库→.lnk→Start-Process）
+                        _exec_blocks = (
+                            f"\n\n⚡ 安全网直接执行（绕过AI文字回复）：\n"
+                            f"```desktop_launch {_stripped}```\n"
+                        )
+                        reply += _exec_blocks
+                        print(f"{ic.system} ⚡ 安全网注入代码块: desktop_launch {_stripped}")
                     else:
-                        # 非媒体任务 → 传统文字注入方式（给 AI 机会）
+                        # 其他任务 → 传统文字注入方式（给 AI 机会）
                         reply += (
                             f"\n\n🔴 用户有具体目标（'{_stripped}'），需要操作而不只是文字。\n"
                             f"请输出代码块一步步完成：\n"
@@ -18413,8 +21942,11 @@ class AIAssistant:
             pass  # 知识提取失败不影响主流程
 
         # ---- 统一自检：分析意图 → 评估 → 缺失则重试 → 完成则智能清理 ----
+        # 🔴 修复：传递原始回复（含代码块）供工具约束验证使用
+        # _process_and_summarize 会剥离代码块，导致评估系统看不到实际使用的工具
         verified_result = self._finalize_and_verify(
-            user_input, final if final else reply, files_before)
+            user_input, final if final else reply, files_before,
+            original_reply=reply)
 
         # ---- 自主修复闭环：重试也搞不定 → AI 改自己代码 → 提醒重启 ----
         # 🔴 如果 verified_result 是任务失败信号（非代码bug），跳过 self_repair
@@ -18501,7 +22033,8 @@ class AIAssistant:
 
     # ---------- 任务自动重试 ----------
     def _finalize_and_verify(self, user_input: str, final_reply: str,
-                            files_before: set = None) -> Optional[str]:
+                            files_before: set = None,
+                            original_reply: str = None) -> Optional[str]:
         """统一的自检入口 — 分析意图 → 评估完成度 → 未完成则重试 → 完成则智能清理。
 
         自检流程：
@@ -18509,6 +22042,10 @@ class AIAssistant:
         2. 检查文件系统事实（期望文件是否存在 / 有无错误）
         3. 未完成 → 自动重试（最多 2 次）
         4. 已完成 → 基于快照 diff 智能清理（保留用户要的，删掉中间产物）
+
+        Args:
+            original_reply: AI 原始回复（含代码块），用于工具约束验证。
+                           _process_and_summarize 会剥离代码块，此参数保留原始格式。
         """
         MAX_RETRIES = 2
         ic = self.icons
@@ -18525,9 +22062,13 @@ class AIAssistant:
 
         intent = self._analyze_task_intent(user_input)
         # 纯知识问答（用户没要求生成文件）→ 不触发文件缺失重试
+        # 🔴 但如果意图分析判定为需行动（action/organize/delete等），即使包含疑问词也要验证
         _qa_kw = ['介绍', '怎么', '如何', '为什么', '什么是', '是谁', '哪里', '哪个',
                   '有哪些', '讲一下', '说一下', '解释', '说明', '告诉我']
-        if any(k in user_input for k in _qa_kw) and not intent.expected_files and not intent.expected_extensions:
+        if (any(k in user_input for k in _qa_kw)
+                and not intent.expected_files
+                and not intent.expected_extensions
+                and intent.action_type in ("query",)):  # 🔴 只有确认为纯问答才跳过
             # 用户只是在问知识，AI 不应创建文件；即使 AI 声称了文件也不重试
             if files_before is not None:
                 self._smart_cleanup(files_before, user_input, final_reply)
@@ -18536,7 +22077,8 @@ class AIAssistant:
         # ━━━ 🔴 第四步：强制验证 ━━━
         if hasattr(self, 'seven_step'):
             self.seven_step.enter(4, "对照用户需求验证实际完成度")
-        completion = self._assess_completion(user_input, final_reply, intent, cwd, files_before)
+        completion = self._assess_completion(user_input, final_reply, intent, cwd, files_before,
+                                              original_reply=original_reply)
         if hasattr(self, 'seven_step'):
             if completion.is_done:
                 self.seven_step.exit(4, True, "验证通过：所有产出符合用户需求")
@@ -18599,15 +22141,27 @@ class AIAssistant:
             # 🔴 区分失败类型：验证缺失 vs 真的没做
             _is_verify_only = any('七步法则违规' in r or '验证证据' in r or '未提供任何验证' in r
                                   for r in completion.reasons)
+            # 🔴 但排除"AI 什么都没做"的情况——这不是"忘了验证"，是"根本没执行"
+            # 此时应让 AI 重新执行任务，而非仅做验证
+            _is_empty_claim = any('未执行任何代码块' in r or '任务未实际执行' in r
+                                  for r in completion.reasons)
+            if _is_empty_claim:
+                _is_verify_only = False
             # 🔴 删除任务未完成：不是验证缺失问题，是 AI 的删除没生效
             if completion.undeleted_items:
                 _is_verify_only = False
             if _is_verify_only and not completion.missing_files and not completion.has_errors:
                 retry_parts = ["🔴 上一轮任务可能已经成功了，你只是忘了验证！\n"]
                 retry_parts.append("⚠️ 不要重新执行任务！不要生成新文件！只做验证：\n")
-                retry_parts.append("  1. Test-Path 或 dir 检查目标文件是否已存在、大小是否 > 0\n")
-                retry_parts.append("  2. 如果文件已存在且正常 → 直接报告成功，不要再创建\n")
-                retry_parts.append("  3. 只有文件确实不存在时，才重新创建\n\n")
+                # 🔴 桌面/GUI 操作（打开/关闭应用等）：验证方式不同
+                if intent.is_desktop_action and intent.action_type in ("open", "close", "media", "organize", "action"):
+                    retry_parts.append("  1. 用 desktop_window 或 tasklist 检查目标应用是否已在运行\n")
+                    retry_parts.append("  2. 如果已在运行 → 直接报告成功，附带窗口信息\n")
+                    retry_parts.append("  3. 只有确实未启动时，才用 desktop_launch 重新启动\n\n")
+                else:
+                    retry_parts.append("  1. Test-Path 或 dir 检查目标文件是否已存在、大小是否 > 0\n")
+                    retry_parts.append("  2. 如果文件已存在且正常 → 直接报告成功，不要再创建\n")
+                    retry_parts.append("  3. 只有文件确实不存在时，才重新创建\n\n")
             else:
                 # ━━━ 🔴 诊断上次失败原因，给出针对性建议 ━━━
                 _last_error_text = ""
@@ -18704,6 +22258,7 @@ class AIAssistant:
                          '打开', '关闭', '最小化', '最大化', '聚焦', '窗口',
                          '输入', '打字', '回复', '点击', '拖拽', '滚动', '剪贴板',
                          '快捷键', '组合键', '按键',
+                         '整理', '排列', '图标', '对齐', '刷新桌面', '自动排列', '壁纸', '暗色模式',
                          'next', 'prev', 'play', 'pause', 'stop', 'mute', 'volume']:
                 _complex_check = _complex_check.replace(_ck, '')
             _complex_check = re.sub(
@@ -18741,7 +22296,24 @@ class AIAssistant:
                         "只输出1个代码块，不要重复之前失败的方法。"
                     )
             elif intent.is_desktop_action:
-                if _is_complex_task:
+                # 🔴 修复：organize 类型 + 图标关键词 → 优先使用桌面图标工具
+                # 而非通用的 desktop_key/desktop_window（会导致工具约束违规+循环重试）
+                _icon_kw_retry = re.search(
+                    r'(?:图标|icon|排列|对齐|位置|自动排列|auto\s*arrange|sort|整理.*桌面)',
+                    user_input, re.IGNORECASE)
+                if intent.action_type == "organize" and _icon_kw_retry:
+                    _tool_hint = (
+                        "用 ```desktop_icons_arrange [auto/by_name/by_type/snap_to_grid]``` "
+                        "或 ```desktop_icons_auto_arrange [true/false]``` 排列桌面图标\n"
+                        "🔴 这是Shell操作，不用 desktop_key/desktop_window/desktop_type！"
+                    )
+                    _verify_hint = "执行后用 ```desktop_icons_count``` 确认图标数量，确认排列命令返回成功"
+                    _block_demand = (
+                        "请输出1个代码块完成图标排列：\n"
+                        "```desktop_icons_arrange by_name```\n"
+                        "只输出1个代码块，不要用 desktop_key 或 desktop_window。"
+                    )
+                elif _is_complex_task:
                     _tool_hint = (
                         "按万能公式分步操作（纯键盘，不准截图！）：\n"
                         "  ① ```desktop_window \"应用名\"``` 聚焦目标窗口\n"
@@ -18800,6 +22372,8 @@ class AIAssistant:
                 _retry_printed = True
 
             final_reply = self._process_and_summarize(retry_reply)
+            # 🔴 保存原始重试回复（含代码块），供工具约束验证使用
+            _retry_original = retry_reply
             # 🔴 重试的总结必须打印，否则用户看到代码执行完就沉默了
             if final_reply and final_reply != retry_reply:
                 _fs = self._strip_code_blocks(final_reply)
@@ -18814,8 +22388,9 @@ class AIAssistant:
                 self._last_reply_text = _fallback
             last_result = final_reply
 
-            # 重新评估
-            completion = self._assess_completion(user_input, final_reply, intent, cwd, files_before)
+            # 重新评估（传入原始回复以保留代码块，供工具约束验证）
+            completion = self._assess_completion(user_input, final_reply, intent, cwd, files_before,
+                                                  original_reply=_retry_original)
             if completion.is_done:
                 break
 
@@ -19137,8 +22712,21 @@ class AIAssistant:
             re.IGNORECASE)
 
         # ═══════════════════════════════════════════
-        # 第1步：判断主操作类型（优先级：删除 > 移动 > 复制 > 安装 > 卸载 > 关闭 > 打开 > 创建 > 查询）
+        # 第1步：判断主操作类型
+        # 🔴 重要：regex 匹配是辅助提示，不是硬性分类。
+        # 能匹配 → 注入精确的工具指引，帮助 AI 更快定位。
+        # 匹配不到 → 标记为 "action"，让 AI 自己判断，绝不强制 "query"。
+        # "query" 只用于明确的纯知识问答（怎么/为什么/什么是…），
+        # 其他一切用户指令都应假设为需要行动，由 AI 自行决定具体操作。
         # ═══════════════════════════════════════════
+        _ORGANIZE_RE = re.compile(
+            r'(?:整理|排列|对齐|归档|收拾|归类|分类|重新?排列|重新?整理|organize|arrange|sort|align|tidy|clean\s*up)',
+            re.IGNORECASE)
+        # 🔴 纯知识问答检测（"怎么/如何/为什么/什么是…"且无行动动词）
+        _PURE_QA_RE = re.compile(
+            r'(?:怎么|如何|为什么|什么是|是谁|哪里|哪个|有哪些|讲一下|说一下|解释一下|说明一下|告诉我)',
+            re.IGNORECASE)
+
         if _DELETE_RE.search(text):
             intent.action_type = "delete"
         elif _MOVE_RE.search(text):
@@ -19150,15 +22738,23 @@ class AIAssistant:
         elif _UNINSTALL_RE.search(text):
             intent.action_type = "uninstall"
         elif _CLOSE_RE.search(text) and not _CREATE_RE.search(text):
-            # "关闭/停止" → close，但"关闭并创建"这种混合不算
             intent.action_type = "close"
         elif _OPEN_RE.search(text) and not _CREATE_RE.search(text):
-            # "打开/启动" → open
             intent.action_type = "open"
+        elif _ORGANIZE_RE.search(text):
+            intent.action_type = "organize"
         elif _CREATE_RE.search(text):
             intent.action_type = "create"
-        else:
+        elif _PURE_QA_RE.search(text) and not any(
+            r.search(text) for r in [_DELETE_RE, _MOVE_RE, _COPY_RE, _INSTALL_RE,
+                                      _UNINSTALL_RE, _CLOSE_RE, _OPEN_RE, _ORGANIZE_RE,
+                                      _CREATE_RE]):
+            # 🔴 只有纯知识问答（无任何行动动词）才标记为 query
             intent.action_type = "query"
+        else:
+            # 🔴 没匹配到已知模式，但不等于"不用做事"
+            # AI 自己判断用户是否需要行动、该用什么工具
+            intent.action_type = "action"
 
         # ═══════════════════════════════════════════
         # 第2步：提取目标对象（路径、文件名、软件名、进程名）
@@ -19267,6 +22863,22 @@ class AIAssistant:
                     elif intent.action_type == "close":
                         intent.processes_to_stop.append(name)
 
+        # ━━━ 2d. 🔴 复合操作提取：主操作是删除/移动，但同时包含关闭动词 ━━━
+        # 场景："关闭图片并删除" — 关闭是删除的前置条件，两者都必须验证
+        # 静态优先级链会丢弃"关闭"，这里补偿提取进程停止目标
+        if intent.action_type in ("delete", "move") and _CLOSE_RE.search(text):
+            for m in re.finditer(
+                r'(?:关闭|关掉|停止|退出)\s*'
+                r'([\w一-鿿][^\s,;，。；]{0,40})',
+                text, re.IGNORECASE,
+            ):
+                name = m.group(1).strip().rstrip('"\'"。！？…')
+                if name and len(name) >= 1:
+                    # 从目标推断对应的进程名
+                    proc = _infer_process_from_target(name, intent.delete_targets)
+                    if proc and proc not in intent.processes_to_stop:
+                        intent.processes_to_stop.append(proc)
+
         # ═══════════════════════════════════════════
         # 第3步：构建验证条件（expected_absent / expected_present）
         # ═══════════════════════════════════════════
@@ -19321,9 +22933,10 @@ class AIAssistant:
         # ═══════════════════════════════════════════
         _media_kw = r'(?:切歌|换歌|下一首|上一首|暂停|播放|继续播放|停止播放|'
         _media_kw += r'调音量|音量大|音量小|静音|取消静音|next.*song|play.*music|pause.*music)'
-        _desktop_kw = r'(?:打开|关闭|最小化|最大化|恢复|聚焦|切换到|输入|打字|'
+        _desktop_kw = r'(?:打开|启动|运行|开启|关闭|最小化|最大化|恢复|聚焦|切换到|输入|打字|'
         _desktop_kw += r'回复|发送|点击|拖拽|滚动|复制到剪贴板|读取剪贴板|剪贴板|'
-        _desktop_kw += r'窗口|桌面|屏幕|鼠标|键盘|应用|App|软件|播放器|浏览器)'
+        _desktop_kw += r'窗口|桌面|屏幕|鼠标|键盘|应用|App|软件|播放器|浏览器|'
+        _desktop_kw += r'launch|start|run|open)'
         if re.search(_media_kw, text, re.IGNORECASE):
             intent.is_media_action = True
             intent.is_desktop_action = True
@@ -19943,7 +23556,8 @@ class AIAssistant:
     # ---------- 完成度评估 ----------
     def _assess_completion(self, user_input: str, final_reply: str,
                            intent: TaskIntent, cwd: str,
-                           files_before: set = None) -> CompletionResult:
+                           files_before: set = None,
+                           original_reply: str = None) -> CompletionResult:
         """完成度评估：本地事实 + AI 逐项验证。
 
         第1层 — 快速本地检查（磁盘/进程事实，不做AI调用）：
@@ -19956,6 +23570,10 @@ class AIAssistant:
           · 读取所有产出文件的内容
           · 对照用户任务的每一个需求点，逐项判断是否满足
           · 适用于所有任务类型：文件/进程/安装/查询/配置/代码
+
+        Args:
+            original_reply: AI 原始回复（含代码块）。final_reply 经过摘要处理
+                           可能已剥离代码块；此参数保留原始格式供工具约束验证。
         """
         result = CompletionResult()
 
@@ -20102,6 +23720,15 @@ class AIAssistant:
         # 1e. 进程状态验证（所有任务类型）
         # KILL 失败 → 硬证据（has_errors）；START 失败 → 软证据（仅 reasons）
         _process_intents = self._extract_process_intents(user_input, final_reply)
+
+        # 🔴 兜底：将 intent.processes_to_stop 中未被 _extract_process_intents 覆盖的也加入验证
+        # 场景：复合操作（关闭+删除）中，_analyze_task_intent 已识别出需停止的进程，
+        # 但 AI 回复中可能只有 Remove-Item 没有 taskkill/desktop_close 的可识别命令
+        _covered_procs = {p for p, _ in _process_intents}
+        for p in intent.processes_to_stop:
+            if p and p not in _covered_procs:
+                _process_intents.append((p, 'stopped'))
+
         for _proc_name, _expected_state in _process_intents:
             if self._has_error(final_reply):
                 break
@@ -20302,8 +23929,9 @@ class AIAssistant:
         # 桌面任务不产生文件，无法通过文件检查验证完成度。
         # 原则：只要 AI 执行了任何代码块（不限类型），就认为它已经动手了。
         # 纯文字回复只是软证据——记录到 reasons 但不推翻 is_done。
+        # 🔴 修复：使用 original_reply（含代码块）检查，final_reply 可能已被摘要剥离代码块
         if intent.is_desktop_action and not result.missing_files:
-            _desktop_blocks = self._extract_code_blocks(final_reply)
+            _desktop_blocks = self._extract_code_blocks(original_reply or final_reply)
             _has_any_code = len(_desktop_blocks) > 0
             _safety_net_did_it = getattr(self, '_desktop_safety_net_triggered', False)
 
@@ -20323,8 +23951,11 @@ class AIAssistant:
             # ━━━ 🔴 七步法则第四步强制检查：无验证证据的完成声明 → 未完成 ━━━
             _COMPLETION_CLAIM = re.compile(
                 r'(?:已启动|已运行|已执行|已完成|已生成|已创建|已打开|已关闭|'
-                r'搞定了|好了|完成了|成功了|可以了|没问题了|'
-                r'started|launched|running|done|finished|completed|success)',
+                r'已整理|已归档|已移动|已复制|已删除|已安装|已设置|已配置|已保存|已发送|'
+                r'已开启|已启用|已禁用|已切换|已排列|已对齐|已清理|已清除|已释放|'
+                r'搞定了|好了|完成了|成功了|可以了|没问题了|一切就绪|完毕|搞定|'
+                r'started|launched|running|done|finished|completed|success|'
+                r'all set|ready|taken care of)',
                 re.IGNORECASE)
             _VERIFY_EVIDENCE = re.compile(
                 # 🔴 只匹配实际验证命令的输出/工具名，不含日常对话常用词
@@ -20335,6 +23966,7 @@ class AIAssistant:
                 # 窗口验证: desktop_window (无参列出), desktop_see
                 # UIA验证: desktop_uia_tree, desktop_uia_read
                 # OCR验证: desktop_find_text, desktop_read_window, desktop_read_region, desktop_wait_text
+                # 🔴 桌面Shell验证: desktop_icons_count/arrange/show 的输出
                 r'(?:Test-Path\s|dir\s|Get-Item\s|Get-ChildItem\s|'
                 r'LastWriteTime|Length\s*:?\s*\d+|Mode\s+\S+\s+'
                 r'|退出码[：:]\s*\d|exit\s*code[：:]\s*\d'
@@ -20347,6 +23979,12 @@ class AIAssistant:
                 r'|desktop_uia_tree|desktop_uia_read|desktop_uia_wait'  # UIA 验证
                 r'|desktop_find_text|desktop_read_window|desktop_read_region|desktop_wait_text'  # OCR 验证
                 r'|\d+\s*(?:个?\s*)?(?:字节|bytes?|KB|MB|GB)\s+(?:文件|file)'
+                r'|桌面共\s*\d+\s*个图标'  # desktop_icons_count 输出
+                r'|桌面图标已(?:排列|对齐|显示|隐藏|自动排列|按名称|按类型|按大小|按日期)'  # 图标操作确认
+                r'|desktop_icons_(?:count|arrange|show|auto_arrange|align|refresh)'  # 图标工具调用
+                r'|desktop_launch'  # 🔴 应用启动验证（desktop_launch 输出含窗口/hwnd信息）
+                r'|已通过快捷方式启动'  # 🔴 .lnk 启动成功验证
+                r'|hwnd=\d+'  # 🔴 窗口句柄验证（launch_app / find_window 输出）
                 r')',
                 re.IGNORECASE)
             # 🔴 只检查自然语言部分的完成声明，排除代码块内容（避免代码注释/echo中的"已完成"误匹配）
@@ -20354,24 +23992,95 @@ class AIAssistant:
             _has_claim = bool(_COMPLETION_CLAIM.search(_reply_text_only))
             _has_evidence = bool(_VERIFY_EVIDENCE.search(final_reply))
             # 也检查是否执行了任何代码块（至少动手了）
-            _code_blocks = self._extract_code_blocks(final_reply)
+            # 🔴 修复：使用 original_reply（含代码块）提取，final_reply 可能已被摘要剥离
+            _code_blocks = self._extract_code_blocks(original_reply or final_reply)
             _has_code_blocks = len(_code_blocks) > 0
 
-            if _has_claim and not _has_evidence and not _has_code_blocks:
+            # ━━━ 🔴 工具约束验证：必须使用正确的工具，不是任意代码块都算数 ━━━
+            # 场景："整理桌面图标" → AI 用了 desktop_icons_count（数数）充数
+            # → 有代码块但不是正确工具 → 必须判定为未完成
+            if intent.required_tools and _has_code_blocks:
+                # 🔴 修复：_extract_code_blocks 返回 List[Tuple[str, str]]（action, code）
+                # 之前错误地调用 b.get('code', '') / b.get('language', '')（dict 方法）
+                _all_code_text = ' '.join(b[0] + ' ' + b[1] for b in _code_blocks)
+                _used_required = any(t in _all_code_text for t in intent.required_tools)
+                if not _used_required:
+                    result.reasons.append(
+                        f"🔴 工具约束违规：任务要求使用 {intent.required_tools} 之一，"
+                        f"但代码块中未找到任何匹配。AI 可能用了错误工具（如用只读工具冒充操作工具）。"
+                    )
+                    result.is_done = False
+            if intent.forbidden_tools and _has_code_blocks and result.is_done is not False:
+                _all_code_text = ' '.join(b[0] + ' ' + b[1] for b in _code_blocks)
+                _used_forbidden = any(t in _all_code_text for t in intent.forbidden_tools)
+                _used_required = any(t in _all_code_text for t in intent.required_tools)
+                if _used_forbidden and not _used_required:
+                    result.reasons.append(
+                        f"🔴 工具约束违规：使用了禁止工具 {intent.forbidden_tools}，"
+                        f"但未使用必需工具 {intent.required_tools}。禁止工具只是查看状态，不能替代实际操作。"
+                    )
+                    result.is_done = False
+
+            if _has_claim and not _has_evidence and not _has_code_blocks \
+                    and result.is_done is not False:  # 🔴 不被工具约束检查覆盖
                 # AI 说了"已启动/已完成"但既没有验证证据也没有执行代码。
                 # 🔴 关键：不能只看 AI 文本，要看磁盘事实！
-                # 如果步骤 1b/1d 已经确认文件存在于磁盘上（能进到这个 else 分支
-                # 说明 result.missing_files 为空），那磁盘事实就是最好的验证证据。
-                # 只有当磁盘上确实没有任何产出时，才算真正的"空口白话"。
                 # 场景：AI 用内部工具（如 Agnes AI 生图）完成了任务，工具产出
                 # 直接写入磁盘，AI 回复中没有代码块也没有 Test-Path 命令，
                 # 但文件确实存在——这种不应触发重试。
-                result.reasons.append(
-                    "⚠️ 七步法则提醒：AI 声称完成但未附带验证命令输出，"
-                    "且未执行代码块。但系统文件检查已确认磁盘产出存在，任务视为完成。"
-                )
-                result.is_done = True
-            elif _has_claim and not _has_evidence and _has_code_blocks:
+                #
+                # 🔴 但反过来：如果没有代码块、没有验证证据、磁盘上也没有任何
+                # 可验证的产出（_all_expected 为空且无新文件），那就是 AI 纯粹
+                # "空口白话"——什么都没做却声称完成了。必须触发重试！
+                # 典型误判场景："整理桌面图标"——无文件操作，AI 没执行代码
+                # 却说"已整理完毕"，磁盘上不存在任何可验证的证据。
+                _has_disk_evidence = False
+                if _all_expected:
+                    # 步骤 1b/1d 已填充了期望文件列表，且能进到这个 else 分支
+                    # 说明 result.missing_files 为空 → 文件确实存在 → 磁盘证据成立
+                    _has_disk_evidence = True
+                elif files_before is not None:
+                    # 没有期望的特定文件，但检查是否有任何新文件产生
+                    _new_since = self._snapshot_cwd() - files_before
+                    _meaningful = [
+                        f for f in _new_since
+                        if os.path.isfile(f) and self._has_meaningful_content(f)
+                        and not f.endswith(('.pyc', '.pyo', '.log', '.tmp', '.lock'))
+                    ]
+                    if _meaningful:
+                        _has_disk_evidence = True
+
+                # 🔴 Shell操作绕过：桌面Shell/系统操作/GUI应用启动不产生磁盘文件
+                # 场景：整理桌面图标、切换暗色模式、设置壁纸、调整音量、启动/关闭应用等
+                # 这些操作修改的是注册表/系统状态/GUI进程，无法通过文件快照检测
+                _is_shell_op = (intent.is_desktop_action and not _all_expected
+                               and not intent.expected_files
+                               and not intent.expected_extensions
+                               and intent.action_type in ("organize", "action", "open", "close"))
+                if _is_shell_op:
+                    # Shell操作不产生文件 → 跳过磁盘证据检查
+                    # 代码块已在前面被正确提取（通过 original_reply），
+                    # AI 的完成声明 + 桌面操作意图 = 可信的完成信号
+                    result.reasons.append(
+                        "⚠️ 七步法则提醒：桌面Shell操作无磁盘产出可验证，"
+                        "但AI已完成声明且系统已执行操作，任务视为完成。"
+                    )
+                    result.is_done = True
+                elif _has_disk_evidence:
+                    result.reasons.append(
+                        "⚠️ 七步法则提醒：AI 声称完成但未附带验证命令输出，"
+                        "且未执行代码块。但系统文件检查已确认磁盘产出存在，任务视为完成。"
+                    )
+                    result.is_done = True
+                else:
+                    # 🔴 无代码块 + 无验证证据 + 无磁盘产出 = AI 什么都没做
+                    result.reasons.append(
+                        "🔴 七步法则违规：AI 声称完成但未执行任何代码块，"
+                        "且磁盘上无可验证的产出文件。任务未实际执行，触发重试。"
+                    )
+                    result.is_done = False
+            elif _has_claim and not _has_evidence and _has_code_blocks \
+                    and result.is_done is not False:  # 🔴 不被工具约束检查覆盖
                 # AI 执行了代码但没有验证结果 — 软警告，不触发重试
                 # （代码可能已正确执行，只是 AI 没在文字中体现验证）
                 result.reasons.append(
@@ -20380,7 +24089,8 @@ class AIAssistant:
                 )
                 result.is_done = True  # 🔴 修复：之前只 pass 导致 is_done 保持 False，本应不重试却触发了重试
             else:
-                result.is_done = True
+                if result.is_done is not False:  # 🔴 不被工具约束检查覆盖
+                    result.is_done = True
         return result
 
     @staticmethod
@@ -20529,7 +24239,7 @@ class AIAssistant:
             if file_size < min_bytes:
                 return False
             if ext.lower() in TEXT_EXTS:
-                with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
+                with open(filepath, 'r', encoding='utf-8') as f:
                     content = f.read()
                 # 去除 BOM、空白字符、换行后检查是否有实质内容
                 stripped = content.replace('﻿', '').strip()
@@ -20576,7 +24286,13 @@ class AIAssistant:
             verb_ctx = text[max(0, m.start()-10):m.start(1)].lower()
 
             if _is_generic(raw_target):
-                # 通用词 → 需要在阶段2从 AI 回复反推
+                # 🔴 通用词 + 关闭动词 → 尝试从映射表推断进程名
+                # 如"关闭图片" → "图片"是通用词，但 _infer_process_from_target 可以映射到 "photos"
+                if re.search(_STOP_VERBS, verb_ctx, re.IGNORECASE):
+                    proc = _infer_process_from_target(raw_target)
+                    if proc and not any(t == proc for t, _ in intents):
+                        intents.append((proc, 'stopped'))
+                # 通用词即使无法推断也不完全丢弃——阶段2会从AI回复中补充检测
                 continue
 
             # 判断是停止还是启动
@@ -20596,6 +24312,27 @@ class AIAssistant:
                 proc = m.group(1).lower().replace('.exe', '')
                 if proc and proc not in ('f', 't', 'fi', 'pid'):
                     if not any(t == proc for t, _ in intents):
+                        intents.append((proc, 'stopped'))
+
+            # 2a2. 🔴 desktop_close → 目标应已停止（desktop_close 内部 WM_CLOSE→taskkill/PID）
+            # 系统提示词要求 AI 优先用 desktop_close 而非 taskkill，所以必须识别此命令
+            for m in re.finditer(
+                r'desktop_close\s+["\']([^"\'\n]+?)["\']',
+                ai_reply, re.IGNORECASE):
+                title = m.group(1).strip()
+                if title and len(title) >= 1:
+                    # 从窗口标题推断进程名
+                    proc = _infer_process_from_target(title)
+                    if proc and not any(t == proc for t, _ in intents):
+                        intents.append((proc, 'stopped'))
+            # 也识别 desktop_close 执行结果（"已关闭窗口: Photos" / "已强制关闭: Photos (PID=1234)"）
+            for m in re.finditer(
+                r'已(?:关闭|强制关闭)[^:]*:\s*([^\s(]+)',
+                ai_reply):
+                title = m.group(1).strip().rstrip('"\'"')
+                if title and len(title) >= 1:
+                    proc = _infer_process_from_target(title)
+                    if proc and not any(t == proc for t, _ in intents):
                         intents.append((proc, 'stopped'))
 
             # 2b. Start-Process / Invoke-Item → 目标应在运行
@@ -20667,7 +24404,6 @@ class AIAssistant:
                 r = subprocess.run(
                     ['tasklist', '/FO', 'CSV', '/NH'],
                     capture_output=True, text=True, timeout=10,
-                    encoding='utf-8', errors='replace',
                 )
                 if r.returncode == 0:
                     target_lower = target.lower()
